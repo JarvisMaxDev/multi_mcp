@@ -8,7 +8,13 @@ import json
 import re
 from typing import Any
 
-_CODE_FENCE_RE = re.compile(r"```(?:json|JSON)?\s*([\s\S]*?)\s*```", re.IGNORECASE)
+# Greedy match (`*` not `*?`) so this handles nested code fences inside the
+# JSON content (e.g. a "fix" field that contains ```python ... ```). The
+# greedy version locks onto the OUTERMOST opening + closing pair instead of
+# truncating at the first inner `````. The fallback in _strip_code_fences
+# uses this for the trailing-text-after-fence case where the
+# end-of-string-anchored greedy pattern doesn't match.
+_CODE_FENCE_RE = re.compile(r"```(?:json|JSON)?\s*([\s\S]*)\s*```", re.IGNORECASE)
 
 _ANALYSIS_BLOCK_RE = re.compile(r"<analysis>[\s\S]*?</analysis>", re.IGNORECASE)
 
@@ -209,42 +215,58 @@ def _unmask_strings(s: str, strings: dict[str, str]) -> str:
 
 
 def _extract_first_json_block(s: str) -> str | None:
-    """Extract first JSON object or array from string.
+    """Extract first parseable JSON object or array from string.
 
-    Handles nested braces/brackets and string escaping.
+    Iterates over every `{` and `[` position in the string and tries to extract
+    a balanced block starting there. Returns the first block that successfully
+    parses as JSON (or parses after repair). This handles cases like
+    `prefix [tag] {"real": "json"}` where the earliest bracket starts a
+    non-JSON fragment that should be skipped in favor of the next valid block.
+
+    Handles nested braces/brackets and string escaping inside JSON strings.
     """
-    starts = [(s.find("{"), "{"), (s.find("["), "[")]
-    starts = [(i, ch) for i, ch in starts if i != -1]
-    if not starts:
-        return None
+    for start in range(len(s)):
+        ch = s[start]
+        if ch not in "{[":
+            continue
+        opener = ch
+        closer = "}" if opener == "{" else "]"
 
-    start, opener = min(starts, key=lambda x: x[0])
-    closer = "}" if opener == "{" else "]"
+        depth = 0
+        in_str = False
+        esc = False
+        quote_char = ""
 
-    depth = 0
-    in_str = False
-    esc = False
-    quote_char = ""
-
-    for i in range(start, len(s)):
-        c = s[i]
-        if in_str:
-            if esc:
-                esc = False
-            elif c == "\\":
-                esc = True
-            elif c == quote_char:
-                in_str = False
-        else:
-            if c in ('"', "'"):
-                in_str = True
-                quote_char = c
-            elif c == opener:
-                depth += 1
-            elif c == closer:
-                depth -= 1
-                if depth == 0:
-                    return s[start : i + 1]
+        for i in range(start, len(s)):
+            c = s[i]
+            if in_str:
+                if esc:
+                    esc = False
+                elif c == "\\":
+                    esc = True
+                elif c == quote_char:
+                    in_str = False
+            else:
+                if c in ('"', "'"):
+                    in_str = True
+                    quote_char = c
+                elif c == opener:
+                    depth += 1
+                elif c == closer:
+                    depth -= 1
+                    if depth == 0:
+                        block = s[start : i + 1]
+                        # Validate that the extracted block is actually parseable
+                        # JSON. If not, keep searching from the next bracket.
+                        try:
+                            json.loads(block)
+                            return block
+                        except json.JSONDecodeError:
+                            try:
+                                json.loads(_repair_json(block))
+                                return block
+                            except json.JSONDecodeError:
+                                break  # this start didn't work, try next bracket
     return None
 
 
@@ -289,8 +311,12 @@ def _repair_json(s: str) -> str:
     masked = re.sub(r"\bFalse\b", "false", masked)
     masked = re.sub(r"\bundefined\b", "null", masked)
     masked = re.sub(r"\bNaN\b", "null", masked)
+    # `\bInfinity\b` matches both `Infinity` and `-Infinity` because the `-`
+    # is treated as a non-word boundary; the previous attempt at a separate
+    # `\b-Infinity\b` substitution was dead code (the `\b` between `[`/`,`
+    # and `-` doesn't fire). The single replacement turns `-Infinity` into
+    # `-1e9999`, which json.loads parses as -inf. Good enough.
     masked = re.sub(r"\bInfinity\b", "1e9999", masked)
-    masked = re.sub(r"\b-Infinity\b", "-1e9999", masked)
 
     # Fix unquoted keys and trailing commas (structural repairs)
     masked = re.sub(_UNQUOTED_KEY_RE, r'\g<prefix>"\g<key>"\g<suffix>', masked)
@@ -341,25 +367,48 @@ def parse_llm_json(text: str) -> Any | None:
         try:
             return json.loads(stripped_input)
         except json.JSONDecodeError:
-            pass  # fall through to the repair pipeline below
+            pass
+        # Try the repair pipeline on the OUTER document before any destructive
+        # fence stripping. This rescues "almost-valid" wrapper JSON (e.g. with a
+        # trailing comma) that contains nested ```json``` markdown inside one of
+        # its string fields — without this step, _strip_code_fences below would
+        # reach into the string and pull out the inner block.
+        try:
+            return json.loads(_repair_json(stripped_input))
+        except json.JSONDecodeError:
+            pass  # fall through to the unwrapping pipeline below
 
     raw = _strip_analysis_blocks(text)
     raw = _strip_code_fences(raw)
     candidate = raw.strip()
 
-    if not candidate.startswith(("{", "[")):
-        block = _extract_first_json_block(candidate)
-        if block is None:
-            return None
-        candidate = block
-
+    # Try direct parse on the unwrapped content first.
     try:
         return json.loads(candidate)
     except Exception:
         pass
 
+    # Try repair pipeline on the unwrapped content.
     repaired = _repair_json(candidate)
     try:
         return json.loads(repaired)
     except Exception:
-        return None
+        pass
+
+    # Last resort: extract a JSON block from anywhere in the candidate. This
+    # handles cases like `Here is the result: {"ok": true} (timestamp: ...)`
+    # where the JSON is embedded in surrounding prose, OR cases where the
+    # input has a leading non-JSON bracket fragment like `[tag] {real json}`.
+    # We always run this even if the candidate starts with `{`/`[` because the
+    # direct parse may have failed due to trailing garbage.
+    block = _extract_first_json_block(candidate)
+    if block is not None:
+        try:
+            return json.loads(block)
+        except Exception:
+            try:
+                return json.loads(_repair_json(block))
+            except Exception:
+                pass
+
+    return None

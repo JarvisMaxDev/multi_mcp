@@ -512,6 +512,143 @@ class TestCLIExecutor:
         assert result == "${MISSING}"
 
     @pytest.mark.asyncio
+    async def test_execute_cli_env_expansion_is_order_independent(
+        self, cli_executor, mock_subprocess_success
+    ):
+        """Regression: codex round-3 finding. cli_env expansion used to iterate
+        in YAML insertion order, so `A=${B}` declared before `B=value` would
+        leave A unresolved. Build a stable lookup map upfront so cross-key
+        references work regardless of order."""
+        # A references B, but A is declared FIRST (would have failed under old code)
+        config = ModelConfig(
+            provider="cli",
+            cli_command="gemini",
+            cli_args=["chat"],
+            cli_parser="json",
+            cli_env={"A": "${B}", "B": "resolved_value"},
+        )
+
+        with (
+            patch("shutil.which", return_value="/usr/bin/gemini"),
+            patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
+            patch("multi_mcp.models.cli_executor.log_llm_interaction"),
+        ):
+            mock_exec.return_value = mock_subprocess_success
+            await cli_executor.execute(
+                canonical_name="gemini-cli",
+                model_config=config,
+                messages=[{"role": "user", "content": "test"}],
+            )
+            call_kwargs = mock_exec.call_args.kwargs
+            env = call_kwargs["env"]
+            # A must be the resolved value of B, not the literal "${B}"
+            assert env["A"] == "resolved_value"
+            assert env["B"] == "resolved_value"
+
+    @pytest.mark.asyncio
+    async def test_execute_tolerates_process_lookup_error_on_cleanup(
+        self, cli_executor, cli_model_config
+    ):
+        """Regression: codex round-3 finding. After process.kill(), the child
+        may have already exited (race window between returncode check and kill),
+        so kill() can raise ProcessLookupError. The cleanup helper must catch it
+        rather than letting it escape and mask the original error response."""
+        mock_process = MagicMock()
+        mock_process.returncode = None  # appears alive at the check
+        mock_process.kill = MagicMock(side_effect=ProcessLookupError("already gone"))
+        # communicate raises a generic error to enter the cleanup branch
+        mock_process.communicate = AsyncMock(side_effect=RuntimeError("subprocess crash"))
+
+        with (
+            patch("shutil.which", return_value="/usr/bin/gemini"),
+            patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
+            patch("multi_mcp.models.cli_executor.log_llm_interaction"),
+        ):
+            mock_exec.return_value = mock_process
+            result = await cli_executor.execute(
+                canonical_name="gemini-cli",
+                model_config=cli_model_config,
+                messages=[{"role": "user", "content": "test"}],
+            )
+            # Must return a structured error, NOT crash with ProcessLookupError
+            assert result.status == "error"
+            assert "ProcessLookupError" not in result.error  # not leaked
+            mock_process.kill.assert_called_once()  # cleanup was attempted
+
+    @pytest.mark.asyncio
+    async def test_execute_preflight_honors_cli_env_path_override(
+        self, cli_executor, mock_subprocess_success
+    ):
+        """Round-4 finding (codex medium): the shutil.which preflight used to
+        consult os.environ PATH only, ignoring any PATH override declared in
+        cli_env. So a CLI binary that's only reachable via a custom PATH would
+        be wrongly rejected before launch. Now env is built first and shutil
+        .which receives `path=env.get("PATH")`."""
+        config = ModelConfig(
+            provider="cli",
+            cli_command="custom-bin",
+            cli_args=["chat"],
+            cli_parser="json",
+            cli_env={"PATH": "/opt/custom/bin:/usr/bin"},
+        )
+
+        captured: dict[str, str | None] = {"path": None}
+
+        def fake_which(cmd, path=None):
+            captured["path"] = path
+            return f"/opt/custom/bin/{cmd}"  # pretend the binary exists there
+
+        with (
+            patch("shutil.which", side_effect=fake_which) as mock_which,
+            patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
+            patch("multi_mcp.models.cli_executor.log_llm_interaction"),
+        ):
+            mock_exec.return_value = mock_subprocess_success
+            result = await cli_executor.execute(
+                canonical_name="custom-cli",
+                model_config=config,
+                messages=[{"role": "user", "content": "hi"}],
+            )
+
+            # Must have been called with explicit path= from the cli_env override
+            assert mock_which.called
+            assert captured["path"] is not None
+            assert "/opt/custom/bin" in captured["path"]
+            # And the call must succeed (not blocked by preflight)
+            assert result.status == "success"
+
+    @pytest.mark.asyncio
+    async def test_execute_cancellation_kills_subprocess_and_propagates(
+        self, cli_executor, cli_model_config
+    ):
+        """Regression: gemini round-3 finding (CRITICAL). When the asyncio task
+        is cancelled (client disconnect, parent task cancel), the subprocess
+        must be killed so it doesn't leak as an orphan, AND the CancelledError
+        must propagate so cancellation actually works."""
+        mock_process = MagicMock()
+        mock_process.returncode = None
+        mock_process.kill = MagicMock()
+        # communicate raises CancelledError to simulate the task being cancelled
+        mock_process.communicate = AsyncMock(side_effect=asyncio.CancelledError())
+
+        with (
+            patch("shutil.which", return_value="/usr/bin/gemini"),
+            patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
+            patch("multi_mcp.models.cli_executor.log_llm_interaction"),
+        ):
+            mock_exec.return_value = mock_process
+
+            # CancelledError must propagate, NOT be swallowed into a ModelResponse
+            with pytest.raises(asyncio.CancelledError):
+                await cli_executor.execute(
+                    canonical_name="gemini-cli",
+                    model_config=cli_model_config,
+                    messages=[{"role": "user", "content": "test"}],
+                )
+            # And the subprocess must have been killed in the cleanup path
+            mock_process.kill.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_execute_logs_interaction(self, cli_executor, cli_model_config, mock_subprocess_success):
         """Test that CLI interactions are logged."""
         with (

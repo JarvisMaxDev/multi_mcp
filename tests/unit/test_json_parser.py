@@ -61,6 +61,82 @@ def test_parse_genuine_single_quoted_json_still_converts():
     assert result == {"status": "ok"}
 
 
+def test_parse_extracts_json_after_leading_bracket_fragment():
+    """Regression: codex round-3 finding. _extract_first_json_block used to pick
+    the EARLIEST `[` or `{` and give up if that fragment didn't parse, returning
+    None. Now it iterates over every bracket position and returns the first one
+    that parses successfully — so `prefix [note] {"real": "json"}` correctly
+    extracts the trailing object."""
+    result = parse_llm_json('prefix [note] {"real": "json"}')
+    assert result == {"real": "json"}
+
+
+def test_parse_extracts_json_with_trailing_garbage():
+    """Regression: gemini round-3 finding. parse_llm_json used to skip block
+    extraction entirely when input started with `{` or `[`. So a clean JSON
+    object followed by trailing prose would fail to parse. Now block extraction
+    runs as a final fallback so trailing garbage is tolerated."""
+    result = parse_llm_json('{"ok": true} (timestamp: 12345)')
+    assert result == {"ok": True}
+
+
+def test_parse_handles_trailing_text_after_closing_code_fence():
+    """Lock-in: gemini round-3 finding #2 was a false positive — the greedy
+    fence pattern requires \\s*$ (closing fence at EOL), but there's a fallback
+    pattern that handles trailing text. Verify the fallback works."""
+    content = '```json\n{"status": "ok"}\n```\nFollow-up commentary here.'
+    result = parse_llm_json(content)
+    assert result == {"status": "ok"}
+
+
+def test_parse_nested_fences_with_trailing_text():
+    """Round-4 finding (gemini high): nested markdown fences (e.g. a "fix" field
+    containing ```python``` blocks) MUST not be truncated by the fallback regex
+    even when the outer LLM output has trailing prose. Previously
+    `_CODE_FENCE_RE` was non-greedy and stopped at the first inner closing
+    ```` ``` ````, mangling the JSON. Now it's greedy and locks onto the
+    OUTERMOST opening + closing pair."""
+    content = (
+        "```json\n"
+        '{"status": "success", "fix": "```python\\nprint(42)\\n```"}\n'
+        "```\n"
+        "Follow-up commentary here."
+    )
+    result = parse_llm_json(content)
+    assert result is not None
+    assert result["status"] == "success"
+    assert "print(42)" in result["fix"]
+    assert "```python" in result["fix"]  # inner fence preserved verbatim
+
+
+def test_parse_outer_json_with_trailing_comma_and_nested_fence():
+    """Round-4 finding (codex medium): if outer JSON is repairable (e.g. trailing
+    comma) AND contains a nested ```json``` block in a string field, the parser
+    must repair the outer document BEFORE running destructive fence stripping —
+    otherwise it would extract the inner block and lose the outer object."""
+    # Trailing comma forces the repair pipeline; nested code fence inside a
+    # string would otherwise be misinterpreted by _strip_code_fences.
+    content = '{"fix": "see ```json\\n{\\"x\\":1}\\n```", "ok": true,}'
+    result = parse_llm_json(content)
+    assert result is not None
+    assert result["ok"] is True
+    assert "```json" in result["fix"]
+
+
+def test_parse_negative_infinity_via_single_substitution():
+    """Round-4 finding (gemini low): the previous `\\b-Infinity\\b` substitution
+    was dead code (word boundary doesn't fire between `[`/`,`/space and `-`).
+    Removed it because the existing `\\bInfinity\\b` substitution already
+    converts `Infinity` to `1e9999`, which means `-Infinity` becomes `-1e9999`,
+    which json.loads parses as -inf. Lock that behavior in."""
+    import math
+
+    result = parse_llm_json('{"a": Infinity, "b": -Infinity}')
+    assert result is not None
+    assert math.isinf(result["a"]) and result["a"] > 0
+    assert math.isinf(result["b"]) and result["b"] < 0
+
+
 def test_parse_with_markdown_fence():
     """Test parsing JSON in markdown fence."""
     content = """```json

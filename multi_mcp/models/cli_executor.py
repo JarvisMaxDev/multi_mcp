@@ -53,8 +53,39 @@ class CLIExecutor:
         # Narrow type for type checker - we know cli_command is str here
         cli_command: str = model_config.cli_command
 
-        # Check if CLI command exists
-        if not shutil.which(cli_command):
+        # Build the subprocess environment FIRST so the cli_env PATH override
+        # (if any) is honored by the shutil.which preflight below. Otherwise a
+        # CLI that's only reachable via a custom PATH set in cli_env would be
+        # rejected before we even try to launch it.
+        env = os.environ.copy()
+
+        # Inject API keys from settings into environment for expansion
+        # This allows ${ANTHROPIC_API_KEY} etc. to work even if not in os.environ
+        if settings.anthropic_api_key:
+            env["ANTHROPIC_API_KEY"] = settings.anthropic_api_key
+        if settings.openai_api_key:
+            env["OPENAI_API_KEY"] = settings.openai_api_key
+        if settings.gemini_api_key:
+            env["GEMINI_API_KEY"] = settings.gemini_api_key
+        if settings.openrouter_api_key:
+            env["OPENROUTER_API_KEY"] = settings.openrouter_api_key
+
+        # Now expand variables in cli_env (e.g., ${ANTHROPIC_API_KEY}).
+        # Build a stable lookup map that contains all cli_env keys upfront so
+        # cross-key references resolve regardless of YAML insertion order.
+        # Without this, `A=${B}` declared before `B=value` in cli_env would
+        # leave A unresolved because B isn't in env yet at A's expansion time.
+        # Same-name variables in os.environ are still respected (process env
+        # takes precedence on conflicts via dict merge order).
+        cli_env_lookup: dict[str, str] = {**model_config.cli_env, **env}
+        for key, value in model_config.cli_env.items():
+            expanded = self._expand_env_vars(value, cli_env_lookup)
+            env[key] = expanded
+            cli_env_lookup[key] = expanded
+
+        # Check if CLI command exists — using the env we just built so any
+        # PATH override from cli_env is taken into account.
+        if not shutil.which(cli_command, path=env.get("PATH")):
             install_hint = self.get_install_hint(cli_command)
             error_msg = f"CLI command '{cli_command}' not found in PATH. {install_hint}"
             logger.error(f"[CLI_CALL] {error_msg}")
@@ -73,26 +104,6 @@ class CLIExecutor:
 
         # Build command
         command = [cli_command, *model_config.cli_args]
-
-        # Prepare environment
-        env = os.environ.copy()
-
-        # Inject API keys from settings into environment for expansion
-        # This allows ${ANTHROPIC_API_KEY} etc. to work even if not in os.environ
-        if settings.anthropic_api_key:
-            env["ANTHROPIC_API_KEY"] = settings.anthropic_api_key
-        if settings.openai_api_key:
-            env["OPENAI_API_KEY"] = settings.openai_api_key
-        if settings.gemini_api_key:
-            env["GEMINI_API_KEY"] = settings.gemini_api_key
-        if settings.openrouter_api_key:
-            env["OPENROUTER_API_KEY"] = settings.openrouter_api_key
-
-        # Now expand variables in cli_env (e.g., ${ANTHROPIC_API_KEY})
-        # Use our env dict for expansion, not os.environ (which may not have the keys in CI)
-        for key, value in model_config.cli_env.items():
-            expanded = self._expand_env_vars(value, env)
-            env[key] = expanded
 
         # Use config timeout or fall back to settings
         timeout = settings.model_timeout_seconds
@@ -175,18 +186,7 @@ class CLIExecutor:
             # timeout because a child that ignores SIGKILL (or whose pipes never
             # drain) would otherwise hang here indefinitely — silently defeating
             # MODEL_TIMEOUT_SECONDS and tying up the worker.
-            if process and process.returncode is None:
-                process.kill()
-                try:
-                    await asyncio.wait_for(process.communicate(), timeout=5.0)
-                except TimeoutError:
-                    logger.warning(
-                        "[CLI_CALL] Timed-out CLI process did not exit cleanly after kill()"
-                    )
-                except Exception:
-                    logger.debug(
-                        "[CLI_CALL] Error while cleaning up timed-out CLI process", exc_info=True
-                    )
+            await self._terminate_subprocess(process, "timed-out")
 
             logger.error(f"[CLI_CALL] {canonical_name} timed out after {timeout}s")
             return ModelResponse.error_response(
@@ -236,23 +236,20 @@ class CLIExecutor:
             )
             return response
 
+        except asyncio.CancelledError:
+            # Higher-level cancellation (client disconnect, parent task cancel,
+            # etc.) — kill the child so we don't leave an orphaned subprocess
+            # consuming CPU/memory after the parent task is gone, then re-raise
+            # so the cancellation actually propagates.
+            await self._terminate_subprocess(process, "cancelled")
+            raise
+
         except Exception as e:
             latency_ms = int((time.perf_counter() - start_time) * 1000)
 
             # Clean up failed subprocess with a bounded drain (same rationale as
             # the TimeoutError branch — don't let kill()+communicate hang forever).
-            if process and process.returncode is None:
-                process.kill()
-                try:
-                    await asyncio.wait_for(process.communicate(), timeout=5.0)
-                except TimeoutError:
-                    logger.warning(
-                        "[CLI_CALL] Failed CLI process did not exit cleanly after kill()"
-                    )
-                except Exception:
-                    logger.debug(
-                        "[CLI_CALL] Error while cleaning up failed CLI process", exc_info=True
-                    )
+            await self._terminate_subprocess(process, "failed")
 
             logger.error(f"[CLI_CALL] {canonical_name} failed with exception: {type(e).__name__}: {e}")
             logger.debug("[CLI_CALL] Full error details", exc_info=True)
@@ -355,6 +352,43 @@ class CLIExecutor:
 
         else:  # "text" or fallback
             return stdout.strip()
+
+    @staticmethod
+    async def _terminate_subprocess(
+        process: asyncio.subprocess.Process | None, reason: str
+    ) -> None:
+        """Best-effort kill + bounded drain of a subprocess pipe.
+
+        Used by all execute() exception branches (timeout, cancellation, generic
+        failure). Guards against:
+        - exit-after-check race: process may exit between the returncode check
+          and kill(), causing ProcessLookupError — caught and logged
+        - hanging communicate(): wrapped in asyncio.wait_for(timeout=5) so a
+          child that ignores SIGKILL or whose pipes never drain cannot defeat
+          MODEL_TIMEOUT_SECONDS
+
+        Never raises — cleanup must not mask the exception that triggered it.
+        """
+        if process is None or process.returncode is not None:
+            return
+        try:
+            process.kill()
+        except ProcessLookupError:
+            logger.debug(f"[CLI_CALL] {reason} CLI process exited before kill()")
+        except Exception:
+            logger.debug(
+                f"[CLI_CALL] Error sending kill() to {reason} CLI process", exc_info=True
+            )
+        try:
+            await asyncio.wait_for(process.communicate(), timeout=5.0)
+        except TimeoutError:
+            logger.warning(
+                f"[CLI_CALL] {reason} CLI process did not exit cleanly within 5s after kill()"
+            )
+        except Exception:
+            logger.debug(
+                f"[CLI_CALL] Error while draining {reason} CLI process", exc_info=True
+            )
 
     @staticmethod
     def _format_messages_as_prompt(messages: list[dict]) -> str:
