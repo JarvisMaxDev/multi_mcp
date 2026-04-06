@@ -63,8 +63,13 @@ class CLIExecutor:
                 model=canonical_name,
             )
 
-        # Extract prompt from messages (use last user message)
-        prompt = messages[-1]["content"] if messages else ""
+        # Serialize all messages with role markers so the system prompt and
+        # conversation history reach the CLI agent. Previously this took only
+        # `messages[-1]["content"]`, which silently dropped the system prompt
+        # (e.g. codereview.md, chat.md) and any prior turns — meaning CLI
+        # models were running without their tool-specific instructions and
+        # multi-turn chat was effectively broken for CLI providers.
+        prompt = self._format_messages_as_prompt(messages)
 
         # Build command
         command = [cli_command, *model_config.cli_args]
@@ -166,13 +171,22 @@ class CLIExecutor:
         except TimeoutError:
             latency_ms = int((time.perf_counter() - start_time) * 1000)
 
-            # Clean up timed-out subprocess
+            # Clean up timed-out subprocess. We bound the drain with a 5s secondary
+            # timeout because a child that ignores SIGKILL (or whose pipes never
+            # drain) would otherwise hang here indefinitely — silently defeating
+            # MODEL_TIMEOUT_SECONDS and tying up the worker.
             if process and process.returncode is None:
                 process.kill()
                 try:
-                    await process.communicate()  # Drain pipes to prevent resource leak
+                    await asyncio.wait_for(process.communicate(), timeout=5.0)
+                except TimeoutError:
+                    logger.warning(
+                        "[CLI_CALL] Timed-out CLI process did not exit cleanly after kill()"
+                    )
                 except Exception:
-                    logger.debug("[CLI_CALL] Error while cleaning up timed-out CLI process", exc_info=True)
+                    logger.debug(
+                        "[CLI_CALL] Error while cleaning up timed-out CLI process", exc_info=True
+                    )
 
             logger.error(f"[CLI_CALL] {canonical_name} timed out after {timeout}s")
             return ModelResponse.error_response(
@@ -194,16 +208,51 @@ class CLIExecutor:
                 latency_ms=latency_ms,
             )
 
+        except ValueError as e:
+            # _parse_output() raises ValueError for application-level errors that
+            # the CLI reports inside its successful subprocess output (e.g. Claude
+            # CLI returning {"is_error": true, "result": "..."}). Without this
+            # explicit branch the generic Exception handler below would mask it
+            # as "CLI execution failed: ValueError: Claude CLI error: ..." which
+            # confusingly suggests a subprocess crash. The CLI actually ran fine —
+            # it just reported a model-side error — so surface that cleanly.
+            latency_ms = int((time.perf_counter() - start_time) * 1000)
+            logger.error(f"[CLI_CALL] {canonical_name} returned application error: {e}")
+            response = ModelResponse.error_response(
+                error=str(e),
+                model=canonical_name,
+                latency_ms=latency_ms,
+            )
+            # Log the interaction so application errors are visible in logs/*.llm.json
+            # alongside successful calls — parity with the success path above.
+            log_llm_interaction(
+                request_data={
+                    "model": canonical_name,
+                    "cli": True,
+                    "command": command,
+                    "prompt_length": len(prompt),
+                },
+                response_data=response.model_dump(),
+            )
+            return response
+
         except Exception as e:
             latency_ms = int((time.perf_counter() - start_time) * 1000)
 
-            # Clean up failed subprocess
+            # Clean up failed subprocess with a bounded drain (same rationale as
+            # the TimeoutError branch — don't let kill()+communicate hang forever).
             if process and process.returncode is None:
                 process.kill()
                 try:
-                    await process.communicate()  # Drain pipes to prevent resource leak
+                    await asyncio.wait_for(process.communicate(), timeout=5.0)
+                except TimeoutError:
+                    logger.warning(
+                        "[CLI_CALL] Failed CLI process did not exit cleanly after kill()"
+                    )
                 except Exception:
-                    logger.debug("[CLI_CALL] Error while cleaning up failed CLI process", exc_info=True)
+                    logger.debug(
+                        "[CLI_CALL] Error while cleaning up failed CLI process", exc_info=True
+                    )
 
             logger.error(f"[CLI_CALL] {canonical_name} failed with exception: {type(e).__name__}: {e}")
             logger.debug("[CLI_CALL] Full error details", exc_info=True)
@@ -223,10 +272,15 @@ class CLIExecutor:
         Returns:
             Installation hint string
         """
+        # Verified package names (April 2026):
+        # - gemini: https://www.npmjs.com/package/@google/gemini-cli
+        # - codex:  https://github.com/openai/codex (npm @openai/codex)
+        # - claude: https://github.com/anthropics/claude-code (npm @anthropic-ai/claude-code)
+        # The previous hints were factually wrong and misled users.
         hints = {
-            "gemini": "Install via: npm install -g @google/generative-ai-cli",
-            "codex": "Install via: npm install -g @anthropic-ai/codex-cli",
-            "claude": "Install via: pip install anthropic-cli",
+            "gemini": "Install via: npm install -g @google/gemini-cli",
+            "codex": "Install via: npm install -g @openai/codex",
+            "claude": "Install via: npm install -g @anthropic-ai/claude-code",
         }
         return hints.get(cli_command, f"Ensure '{cli_command}' is installed and in PATH")
 
@@ -254,12 +308,22 @@ class CLIExecutor:
                         raise ValueError(f"Claude CLI error: {error_msg}")
 
                     # Gemini CLI format: {"response": "content"}
-                    if "response" in parsed:
-                        return parsed["response"]
                     # Claude CLI format: {"result": "content"}
-                    elif "result" in parsed:
-                        return parsed["result"]
-                return str(parsed)
+                    # Both fields are normally strings, but we defensively handle
+                    # nested objects/arrays by re-serializing as JSON so the
+                    # return type stays `str` and downstream consumers don't get
+                    # a surprise dict/list (which would then hit Python repr).
+                    for key in ("response", "result"):
+                        if key in parsed:
+                            val = parsed[key]
+                            if isinstance(val, str):
+                                return val
+                            return json.dumps(val, ensure_ascii=False)
+                # Non-dict or unknown-shape JSON (lists, scalars, dict without
+                # known content keys): re-serialize as JSON rather than using
+                # Python repr via str(). str(parsed) produces single-quoted
+                # output that downstream JSON consumers cannot re-parse.
+                return json.dumps(parsed, ensure_ascii=False)
             else:
                 logger.warning("[CLI_PARSE] JSON parse failed, falling back to text")
                 return stdout.strip()
@@ -292,11 +356,91 @@ class CLIExecutor:
         else:  # "text" or fallback
             return stdout.strip()
 
+    @staticmethod
+    def _format_messages_as_prompt(messages: list[dict]) -> str:
+        """Serialize a list of role/content message dicts into a single prompt string.
+
+        CLI agents (claude, codex, gemini) consume their prompt via stdin as a single
+        string — they have no native concept of a multi-message conversation array
+        the way the OpenAI/Anthropic chat APIs do. We therefore flatten the message
+        list into a labeled transcript so that the system prompt and earlier turns
+        are preserved end-to-end.
+
+        Format:
+            [SYSTEM]
+            <system content>
+
+            [USER]
+            <user content>
+
+            [ASSISTANT]
+            <assistant content>
+
+            ...
+
+        Content normalization (parity with LiteLLM/Anthropic message formats):
+            - None                     → ""
+            - str                      → as-is
+            - list of parts            → concatenated `text` fields of dict parts
+              (multimodal messages drop image/tool parts — CLI agents can't render them)
+            - anything else            → json.dumps(..., ensure_ascii=False, default=str)
+              (produces valid JSON rather than Python repr with single quotes)
+
+        Empty messages list yields an empty string.
+        """
+        if not messages:
+            return ""
+        parts: list[str] = []
+        for msg in messages:
+            role_raw = msg.get("role")
+            role = str(role_raw if role_raw else "user").upper()
+            content = CLIExecutor._normalize_content(msg.get("content"))
+            parts.append(f"[{role}]\n{content}")
+        return "\n\n".join(parts)
+
+    @staticmethod
+    def _normalize_content(content: object) -> str:
+        """Coerce heterogeneous message content into a plain string.
+
+        Mirrors the shapes that LiteLLM / Anthropic / OpenAI APIs produce so that
+        CLI agents see equivalent input to API models. See _format_messages_as_prompt
+        for the normalization contract.
+        """
+        if content is None:
+            return ""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            # Multimodal / tool-use: keep only text parts, drop images/tool calls
+            text_parts: list[str] = []
+            for part in content:
+                if isinstance(part, str):
+                    text_parts.append(part)
+                # Anthropic / OpenAI style: {"type": "text", "text": "..."}
+                elif (
+                    isinstance(part, dict)
+                    and part.get("type") == "text"
+                    and isinstance(part.get("text"), str)
+                ):
+                    text_parts.append(part["text"])
+            return "\n".join(text_parts)
+        # Fallback: serialize as JSON (not Python repr — json.dumps uses double quotes
+        # and is re-parseable downstream). default=str handles datetimes, Paths, etc.
+        try:
+            return json.dumps(content, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            # Last-resort fallback for truly unserializable content
+            return str(content)
+
     def _expand_env_vars(self, value: str, env: dict[str, str]) -> str:
         """Expand environment variables in a string using provided env dict.
 
         Handles ${VAR_NAME} syntax. Uses the provided env dict instead of os.environ
         so that variables injected from settings are properly expanded.
+
+        Supports nested references (${FOO} where FOO=${BAR}) by iterating until
+        the substitution is stable, bounded to 5 passes to avoid infinite loops
+        on reference cycles.
 
         Args:
             value: String that may contain ${VAR_NAME} patterns
@@ -312,4 +456,9 @@ class CLIExecutor:
             # If variable not found in env, return original ${VAR} syntax
             return result if result is not None else match.group(0)
 
-        return re.sub(r"\$\{([^}]+)\}", replacer, value)
+        for _ in range(5):
+            new_value = re.sub(r"\$\{([^}]+)\}", replacer, value)
+            if new_value == value:
+                break
+            value = new_value
+        return value

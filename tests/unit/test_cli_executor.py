@@ -186,6 +186,45 @@ class TestCLIExecutor:
         with pytest.raises(ValueError, match="Claude CLI error"):
             cli_executor._parse_output(stdout, "json")
 
+    @pytest.mark.asyncio
+    async def test_execute_surfaces_claude_application_error_cleanly(
+        self, cli_executor, cli_model_config
+    ):
+        """When Claude CLI reports is_error=true, execute() must return a clean error
+        response — not a misleading 'CLI execution failed: ValueError: ...' wrapper.
+
+        Regression: previously _parse_output raised ValueError, which was caught by the
+        generic Exception handler and surfaced to users as if the subprocess crashed.
+        The CLI actually succeeded (exit code 0); only the model reported a problem.
+        """
+        mock_process = MagicMock()
+        mock_process.returncode = 0
+        mock_process.communicate = AsyncMock(
+            return_value=(b'{"result": "rate limit exceeded", "is_error": true}', b"")
+        )
+
+        with (
+            patch("shutil.which", return_value="/usr/bin/claude"),
+            patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
+            patch("multi_mcp.models.cli_executor.log_llm_interaction"),
+        ):
+            mock_exec.return_value = mock_process
+
+            result = await cli_executor.execute(
+                canonical_name="claude-cli",
+                model_config=cli_model_config,
+                messages=[{"role": "user", "content": "test"}],
+            )
+
+            assert result.status == "error"
+            # Error must contain the actual Claude message, not a Python exception trace
+            assert "rate limit exceeded" in result.error
+            assert "Claude CLI error" in result.error
+            # Must NOT be wrapped in "CLI execution failed: ValueError: ..."
+            assert "CLI execution failed" not in result.error
+            assert "ValueError" not in result.error
+            assert result.metadata.model == "claude-cli"
+
     def test_parse_output_json_malformed(self, cli_executor):
         """Test JSON parsing fallback for malformed JSON."""
         stdout = "not valid json"
@@ -221,22 +260,22 @@ class TestCLIExecutor:
         assert result == "Simple text response"
 
     def test_get_install_hint_gemini(self, cli_executor):
-        """Test install hint for gemini CLI."""
+        """Install hint for gemini CLI must point at the real published package."""
         hint = cli_executor.get_install_hint("gemini")
         assert "npm install" in hint
-        assert "@google/generative-ai-cli" in hint
+        assert "@google/gemini-cli" in hint
 
     def test_get_install_hint_codex(self, cli_executor):
-        """Test install hint for codex CLI."""
+        """Install hint for codex CLI must point at OpenAI's real package (not Anthropic's)."""
         hint = cli_executor.get_install_hint("codex")
         assert "npm install" in hint
-        assert "@anthropic-ai/codex-cli" in hint
+        assert "@openai/codex" in hint
 
     def test_get_install_hint_claude(self, cli_executor):
-        """Test install hint for claude CLI."""
+        """Install hint for Claude Code CLI must use npm (not pip — it's a Node package)."""
         hint = cli_executor.get_install_hint("claude")
-        assert "pip install" in hint
-        assert "anthropic-cli" in hint
+        assert "npm install" in hint
+        assert "@anthropic-ai/claude-code" in hint
 
     def test_get_install_hint_unknown(self, cli_executor):
         """Test install hint for unknown CLI."""
@@ -290,8 +329,13 @@ class TestCLIExecutor:
             assert result.status == "success"
 
     @pytest.mark.asyncio
-    async def test_execute_uses_last_user_message(self, cli_executor, cli_model_config):
-        """Test that last user message is used as prompt."""
+    async def test_execute_serializes_full_message_history(self, cli_executor, cli_model_config):
+        """All messages (system + history + new user turn) should reach the CLI as a labeled transcript.
+
+        Previously the executor sent only `messages[-1]["content"]`, silently dropping
+        the system prompt and any prior turns. The fix serializes the full conversation
+        with role markers so CLI agents receive the same context as API models.
+        """
         messages = [
             {"role": "system", "content": "System prompt"},
             {"role": "user", "content": "First question"},
@@ -316,10 +360,156 @@ class TestCLIExecutor:
                 messages=messages,
             )
 
-            # Verify stdin received last message content
             communicate_call = mock_process.communicate.call_args
-            stdin_data = communicate_call[1]["input"]
-            assert stdin_data == b"Second question"
+            stdin_data = communicate_call[1]["input"].decode("utf-8")
+
+            # All four messages must appear in stdin, in order, with role markers
+            assert "[SYSTEM]\nSystem prompt" in stdin_data
+            assert "[USER]\nFirst question" in stdin_data
+            assert "[ASSISTANT]\nFirst answer" in stdin_data
+            assert "[USER]\nSecond question" in stdin_data
+            # Order check: system first, last user message last
+            assert stdin_data.index("[SYSTEM]") < stdin_data.index("[USER]\nFirst question")
+            assert stdin_data.index("[USER]\nFirst question") < stdin_data.index("[ASSISTANT]")
+            assert stdin_data.index("[ASSISTANT]") < stdin_data.index("[USER]\nSecond question")
+
+    @pytest.mark.asyncio
+    async def test_format_messages_as_prompt_empty(self, cli_executor):
+        """Empty message list serializes to empty string (no crash)."""
+        assert cli_executor._format_messages_as_prompt([]) == ""
+
+    @pytest.mark.asyncio
+    async def test_format_messages_as_prompt_single_user(self, cli_executor):
+        """Single user message serializes with role marker."""
+        result = cli_executor._format_messages_as_prompt(
+            [{"role": "user", "content": "Hello"}]
+        )
+        assert result == "[USER]\nHello"
+
+    @pytest.mark.asyncio
+    async def test_format_messages_as_prompt_missing_role_defaults_to_user(self, cli_executor):
+        """Messages without an explicit role default to user (defensive)."""
+        result = cli_executor._format_messages_as_prompt([{"content": "no role here"}])
+        assert result == "[USER]\nno role here"
+
+    @pytest.mark.asyncio
+    async def test_format_messages_as_prompt_none_content(self, cli_executor):
+        """None content must become an empty string, not the literal 'None'."""
+        result = cli_executor._format_messages_as_prompt(
+            [{"role": "user", "content": None}]
+        )
+        assert result == "[USER]\n"
+        assert "None" not in result  # the literal word "None" must NOT appear
+
+    @pytest.mark.asyncio
+    async def test_format_messages_as_prompt_missing_content_key(self, cli_executor):
+        """Missing content key must behave like empty content."""
+        result = cli_executor._format_messages_as_prompt([{"role": "user"}])
+        assert result == "[USER]\n"
+
+    @pytest.mark.asyncio
+    async def test_format_messages_as_prompt_list_content_text_parts(self, cli_executor):
+        """Anthropic/OpenAI style list-of-parts content: keep text parts, drop others."""
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "hello"},
+                    {"type": "image", "source": {"type": "base64", "data": "..."}},
+                    {"type": "text", "text": "world"},
+                ],
+            }
+        ]
+        result = cli_executor._format_messages_as_prompt(messages)
+        assert result == "[USER]\nhello\nworld"
+        assert "base64" not in result  # image part must be dropped
+
+    @pytest.mark.asyncio
+    async def test_format_messages_as_prompt_list_with_raw_strings(self, cli_executor):
+        """List content that contains raw strings should keep them too."""
+        messages = [{"role": "user", "content": ["first", "second"]}]
+        result = cli_executor._format_messages_as_prompt(messages)
+        assert result == "[USER]\nfirst\nsecond"
+
+    @pytest.mark.asyncio
+    async def test_format_messages_as_prompt_non_string_content_uses_json(self, cli_executor):
+        """Non-string scalar content falls back to JSON (not Python repr)."""
+        messages = [{"role": "user", "content": {"key": "value"}}]
+        result = cli_executor._format_messages_as_prompt(messages)
+        # Must use double quotes (json) not single quotes (Python repr)
+        assert '"key"' in result
+        assert '"value"' in result
+        assert "'key'" not in result  # single-quoted repr must NOT appear
+
+    @pytest.mark.asyncio
+    async def test_parse_output_json_non_dict_returns_valid_json(self, cli_executor):
+        """Fallthrough for non-dict JSON (e.g. bare list) must return re-parseable JSON, not Python repr."""
+        stdout = '[{"a": 1}, {"b": 2}]'
+        result = cli_executor._parse_output(stdout, "json")
+        # Result must be valid JSON (double-quoted), not Python repr
+        import json as _json
+
+        reparsed = _json.loads(result)
+        assert reparsed == [{"a": 1}, {"b": 2}]
+
+    def test_parse_output_json_response_nested_object_reserialized(self, cli_executor):
+        """If a CLI wraps a nested object under `response`, we must re-serialize it
+        as JSON so the return type stays `str` and downstream consumers don't hit
+        Python repr with single quotes."""
+        stdout = '{"response": {"answer": 42, "ok": true}}'
+        result = cli_executor._parse_output(stdout, "json")
+        # Must be a string (return type contract)
+        assert isinstance(result, str)
+        # Must be re-parseable JSON (not Python repr)
+        import json as _json
+
+        reparsed = _json.loads(result)
+        assert reparsed == {"answer": 42, "ok": True}
+        # Defensive: no single-quoted Python dict repr should leak through
+        assert "'" not in result or '"' in result  # double quotes present
+
+    def test_parse_output_json_result_nested_object_reserialized(self, cli_executor):
+        """Same contract for Claude-style {\"result\": <nested obj>} — must return valid JSON string."""
+        stdout = '{"result": [1, 2, 3], "is_error": false}'
+        result = cli_executor._parse_output(stdout, "json")
+        assert isinstance(result, str)
+        import json as _json
+
+        reparsed = _json.loads(result)
+        assert reparsed == [1, 2, 3]
+
+    def test_expand_env_vars_resolves_nested_references(self, cli_executor):
+        """_expand_env_vars should resolve multi-level ${VAR} references by iterating."""
+        env = {
+            "FOO": "${BAR}",
+            "BAR": "${BAZ}",
+            "BAZ": "final",
+        }
+        # value references FOO, which references BAR, which references BAZ
+        result = cli_executor._expand_env_vars("${FOO}", env)
+        assert result == "final"
+
+    def test_expand_env_vars_stops_on_cycle(self, cli_executor):
+        """Reference cycles must not cause infinite loops — bounded iteration."""
+        env = {
+            "A": "${B}",
+            "B": "${A}",
+        }
+        # Should not hang; exact output doesn't matter as long as it returns
+        result = cli_executor._expand_env_vars("${A}", env)
+        assert isinstance(result, str)  # terminates cleanly
+
+    def test_expand_env_vars_single_level_still_works(self, cli_executor):
+        """Single-level substitution (the common case) must still work."""
+        env = {"KEY": "secret123"}
+        result = cli_executor._expand_env_vars("${KEY}", env)
+        assert result == "secret123"
+
+    def test_expand_env_vars_missing_var_left_as_is(self, cli_executor):
+        """Unknown variables should be left as ${NAME} literal (unchanged contract)."""
+        env = {}
+        result = cli_executor._expand_env_vars("${MISSING}", env)
+        assert result == "${MISSING}"
 
     @pytest.mark.asyncio
     async def test_execute_logs_interaction(self, cli_executor, cli_model_config, mock_subprocess_success):

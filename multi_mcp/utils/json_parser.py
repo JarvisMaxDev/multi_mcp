@@ -93,17 +93,44 @@ def _convert_single_to_double_quotes(s: str) -> str:
     that use single quotes instead.
 
     Approach:
-    - Find single-quoted strings (handling escaped quotes inside)
-    - Replace outer single quotes with double quotes
-    - Escape any unescaped double quotes inside the string
+    - Track whether we're currently inside a valid double-quoted string; if so,
+      copy apostrophes verbatim so `"it's fine"` is preserved intact.
+    - Outside double-quoted context, single quotes start a single-quoted string
+      scan that collects content, escapes any unescaped double quotes, and
+      re-wraps the result in double quotes.
     """
     result = []
     i = 0
     length = len(s)
+    in_double_quotes = False
+    dq_escaped = False
 
     while i < length:
+        char = s[i]
+
+        # Inside a double-quoted string: preserve everything verbatim (including
+        # apostrophes and backslash escapes). This is the fix for `"it's fine"`.
+        if in_double_quotes:
+            result.append(char)
+            if dq_escaped:
+                dq_escaped = False
+            elif char == "\\":
+                dq_escaped = True
+            elif char == '"':
+                in_double_quotes = False
+            i += 1
+            continue
+
+        # Outside double-quoted context:
+        if char == '"':
+            # Entering a double-quoted string
+            result.append(char)
+            in_double_quotes = True
+            i += 1
+            continue
+
         # Check if we're at the start of a single-quoted string
-        if s[i] == "'":
+        if char == "'":
             # Collect the string content
             string_start = i
             i += 1
@@ -136,7 +163,7 @@ def _convert_single_to_double_quotes(s: str) -> str:
                 # Unclosed single quote - just keep original
                 result.append(s[string_start:i])
         else:
-            result.append(s[i])
+            result.append(char)
             i += 1
 
     return "".join(result)
@@ -243,7 +270,11 @@ def _repair_json(s: str) -> str:
     # Normalize smart quotes before masking (safe to run on everything)
     s = _normalize_quotes(s)
 
-    # Convert single-quoted strings to double-quoted strings
+    # Convert single-quoted strings to double-quoted strings. The scanner is
+    # state-aware — it tracks whether we're inside a double-quoted string and
+    # copies apostrophes verbatim there, so `"it's fine"` is preserved
+    # correctly, while genuine single-quoted literals like 'msg' still get
+    # converted.
     s = _convert_single_to_double_quotes(s)
 
     # Mask string literals to protect their content during repairs
@@ -296,6 +327,21 @@ def parse_llm_json(text: str) -> Any | None:
     """
     if not isinstance(text, str) or not text.strip():
         return None
+
+    # Fast path: if the input is already a clean JSON document, parse it directly.
+    # This avoids a subtle bug where the markdown-fence stripper would otherwise
+    # reach INTO a JSON-encoded string field (e.g. CLI wrappers like
+    # `{"session_id": "...", "response": "### text\n```json\n[...]\n```"}`)
+    # and incorrectly extract the inner code fence instead of returning the outer
+    # object. We only fall through to fence-stripping when the raw parse fails.
+    # We catch JSONDecodeError specifically — unrelated errors (RecursionError on
+    # pathological input, MemoryError, etc.) should propagate so real bugs surface.
+    stripped_input = text.strip()
+    if stripped_input.startswith(("{", "[")):
+        try:
+            return json.loads(stripped_input)
+        except json.JSONDecodeError:
+            pass  # fall through to the repair pipeline below
 
     raw = _strip_analysis_blocks(text)
     raw = _strip_code_fences(raw)

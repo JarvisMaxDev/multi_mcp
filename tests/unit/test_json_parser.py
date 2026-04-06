@@ -9,6 +9,58 @@ def test_parse_simple_json():
     assert result == {"status": "no_issues_found", "message": "Great"}
 
 
+def test_parse_outer_json_with_inner_code_fence_in_string():
+    """Regression: gemini-cli wraps responses as `{session_id, response, stats}`
+    where the `response` field contains markdown text that itself includes a
+    ```json ... ``` code block. The previous fence-stripping logic would reach
+    INTO that nested string and extract the inner code fence, returning a list
+    instead of the outer dict — which then caused codereview.py to fail with
+    'Failed to parse LLM response as JSON'. We must return the OUTER object."""
+    gemini_wrapper = (
+        '{"session_id": "abc-123", '
+        '"response": "### Analysis\\n1. SQL Injection.\\n```json\\n[{\\"issue\\": \\"sqli\\"}]\\n```", '
+        '"stats": {"tokens": 100}}'
+    )
+    result = parse_llm_json(gemini_wrapper)
+    assert isinstance(result, dict), f"expected outer dict, got {type(result).__name__}"
+    assert result.get("session_id") == "abc-123"
+    assert "response" in result
+    assert "### Analysis" in result["response"]
+    assert result.get("stats", {}).get("tokens") == 100
+
+
+def test_parse_clean_json_array_returns_list():
+    """A clean JSON array at top level should round-trip as a Python list."""
+    result = parse_llm_json('[{"a": 1}, {"b": 2}]')
+    assert result == [{"a": 1}, {"b": 2}]
+
+
+def test_parse_preserves_apostrophes_inside_double_quoted_strings():
+    """Regression: _convert_single_to_double_quotes used to run BEFORE string
+    masking, so an apostrophe inside a valid double-quoted string (e.g. 'it\\'s
+    fine') would trigger a spurious single-quoted-string scan and mangle the
+    content. The fix masks double-quoted strings first, then converts only the
+    unmasked single-quoted literals.
+
+    Failure mode: {"message": "it's fine",} enters repair mode because of the
+    trailing comma, then the repair used to corrupt the apostrophe."""
+    result = parse_llm_json('{"message": "it\'s fine",}')
+    assert result == {"message": "it's fine"}
+
+
+def test_parse_preserves_multiple_apostrophes_in_double_quoted_content():
+    """Multiple apostrophes in the same double-quoted string must all survive repair."""
+    # The outer dict needs a trailing comma to force the repair pipeline
+    result = parse_llm_json('{"msg": "it\'s John\'s car, isn\'t it?",}')
+    assert result == {"msg": "it's John's car, isn't it?"}
+
+
+def test_parse_genuine_single_quoted_json_still_converts():
+    """The fix must NOT break conversion of genuinely single-quoted JSON literals."""
+    result = parse_llm_json("{'status': 'ok'}")
+    assert result == {"status": "ok"}
+
+
 def test_parse_with_markdown_fence():
     """Test parsing JSON in markdown fence."""
     content = """```json
