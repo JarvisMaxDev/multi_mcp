@@ -123,6 +123,39 @@ def test_parse_outer_json_with_trailing_comma_and_nested_fence():
     assert "```json" in result["fix"]
 
 
+def test_parse_prefers_longest_block_over_accidental_empty_brackets():
+    """Regression: round-5 finding. Round-4 made _extract_first_json_block
+    iterate over every bracket position and return the FIRST parseable block,
+    assuming "parseable == intended". But prose frequently contains tokens
+    like `messages[].content` or `dict{}` that form balanced EMPTY brackets
+    which happen to be valid JSON (`[]` / `{}`). The parser would extract the
+    accidental empty container, codereview.py would reject it via
+    `if not parsed_json` because empty containers are falsy, and the real
+    JSON later in the text would be lost under a misleading "Failed to parse"
+    warning. Fix: prefer the LONGEST parseable block — real payloads are
+    almost always larger than prose artifacts."""
+    content = (
+        "Проверяю межфайловую совместимость: какие формы "
+        "`messages[].content` реально строятся в проекте. "
+        'После этого только verdict.\n{"status":"no_issues_found",'
+        '"message":"all checks passed"}'
+    )
+    result = parse_llm_json(content)
+    assert result is not None
+    assert isinstance(result, dict)  # NOT [] from the messages[] artifact
+    assert result["status"] == "no_issues_found"
+    assert result["message"] == "all checks passed"
+
+
+def test_parse_returns_legitimate_empty_container_when_nothing_larger():
+    """Counter-regression for the "prefer longest" fix: if the ONLY parseable
+    block is a legitimate empty `[]` or `{}`, still return it. The "prefer
+    longest" rule must degrade gracefully to "the only one that parses" when
+    there's no larger alternative."""
+    assert parse_llm_json("API returned: []") == []
+    assert parse_llm_json("response: {}") == {}
+
+
 def test_parse_negative_infinity_via_single_substitution():
     """Round-4 finding (gemini low): the previous `\\b-Infinity\\b` substitution
     was dead code (word boundary doesn't fire between `[`/`,`/space and `-`).

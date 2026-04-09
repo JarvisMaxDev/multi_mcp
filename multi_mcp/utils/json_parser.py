@@ -215,16 +215,28 @@ def _unmask_strings(s: str, strings: dict[str, str]) -> str:
 
 
 def _extract_first_json_block(s: str) -> str | None:
-    """Extract first parseable JSON object or array from string.
+    """Extract the longest parseable JSON object or array from a string.
 
-    Iterates over every `{` and `[` position in the string and tries to extract
-    a balanced block starting there. Returns the first block that successfully
-    parses as JSON (or parses after repair). This handles cases like
-    `prefix [tag] {"real": "json"}` where the earliest bracket starts a
-    non-JSON fragment that should be skipped in favor of the next valid block.
+    Iterates over every `{` and `[` position in the string, tries to extract a
+    balanced block starting there, and returns the LONGEST one that successfully
+    parses as JSON (or parses after repair).
+
+    Why "longest" instead of "first": prose text routinely contains tokens like
+    ``messages[].content`` or ``dict{}`` that happen to form balanced empty
+    brackets. A strict first-match policy would extract the accidental `[]` /
+    `{}` from the prose, json.loads would happily accept it as a valid empty
+    container, and the real JSON later in the string would be lost. By picking
+    the longest block we prefer substantive content over accidental empty
+    containers — the intended payload is almost always larger than any prose
+    artifact.
+
+    If the input is a legitimate `{}` / `[]` and nothing else parses, that
+    empty container is still returned (it's the longest-and-only match).
 
     Handles nested braces/brackets and string escaping inside JSON strings.
     """
+    best_block: str | None = None
+
     for start in range(len(s)):
         ch = s[start]
         if ch not in "{[":
@@ -256,18 +268,21 @@ def _extract_first_json_block(s: str) -> str | None:
                     depth -= 1
                     if depth == 0:
                         block = s[start : i + 1]
-                        # Validate that the extracted block is actually parseable
-                        # JSON. If not, keep searching from the next bracket.
+                        parses = False
                         try:
                             json.loads(block)
-                            return block
+                            parses = True
                         except json.JSONDecodeError:
                             try:
                                 json.loads(_repair_json(block))
-                                return block
+                                parses = True
                             except json.JSONDecodeError:
-                                break  # this start didn't work, try next bracket
-    return None
+                                pass
+                        if parses and (best_block is None or len(block) > len(best_block)):
+                            best_block = block
+                        break  # done with this start position
+
+    return best_block
 
 
 def _repair_json(s: str) -> str:
