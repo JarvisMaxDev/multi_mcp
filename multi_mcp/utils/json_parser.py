@@ -199,8 +199,19 @@ def _mask_strings(s: str) -> tuple[str, dict[str, str]]:
     return masked, strings
 
 
+_PLACEHOLDER_RE = re.compile(r"@STR_\d+@")
+
+
 def _unmask_strings(s: str, strings: dict[str, str]) -> str:
     """Restore masked string literals.
+
+    Uses a single-pass ``re.sub`` instead of a loop of ``s.replace()`` calls:
+    sequential replacement would corrupt data if a restored string happened to
+    contain a substring matching a placeholder we haven't processed yet (e.g.
+    the restored string contains the literal text ``@STR_2@`` because an LLM
+    echoed an earlier debug message back). Single-pass scanning walks the
+    string once and only substitutes real placeholders, never touching content
+    that was just restored.
 
     Args:
         s: String with placeholders
@@ -209,9 +220,9 @@ def _unmask_strings(s: str, strings: dict[str, str]) -> str:
     Returns:
         String with original string literals restored
     """
-    for placeholder, original in strings.items():
-        s = s.replace(placeholder, original)
-    return s
+    if not strings:
+        return s
+    return _PLACEHOLDER_RE.sub(lambda m: strings.get(m.group(0), m.group(0)), s)
 
 
 def _scan_balanced_block(s: str, start: int) -> str | None:
@@ -366,13 +377,22 @@ def _repair_json(s: str) -> str:
     # Restore original string literals
     s = _unmask_strings(masked, string_map)
 
-    # Fix invalid escape sequences (including inside strings)
+    # Fix invalid escape sequences (including inside strings).
     # JSON only allows: \" \\ \/ \b \f \n \r \t \uXXXX
-    # Replace \' with ' (single quotes don't need escaping in JSON)
-    s = s.replace("\\'", "'")
-    # Replace other invalid escapes by removing the backslash
-    # Match backslash followed by any char that's NOT a valid escape
-    s = re.sub(r'\\([^"\\\/bfnrtu])', r"\1", s)
+    # We walk escapes PAIR-BY-PAIR (each `\x` consumes both chars) instead of
+    # a single char-class regex, because the char-class approach had a subtle
+    # data corruption bug: for input `\\W` (literal backslash + W — a common
+    # case after repairing paths like `C:\\Windows`), the engine would skip
+    # position 0 (the `\\` pair with excluded `\`), then match position 1
+    # (`\W` where W is not excluded), stripping the second backslash and
+    # corrupting the valid `\\` escape into `\W`. Pair-by-pair consumption
+    # prevents the scanner from ever "sliding into" the middle of a valid
+    # escape.
+    s = re.sub(
+        r"\\.",
+        lambda m: m.group(0) if m.group(0)[1] in '"\\/bfnrtu' else m.group(0)[1],
+        s,
+    )
 
     return s
 

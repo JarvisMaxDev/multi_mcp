@@ -178,6 +178,59 @@ def test_parse_prefers_earliest_non_empty_block_over_later_longer_one():
     assert "a" not in result
 
 
+def test_repair_preserves_valid_backslash_escapes_in_paths():
+    """Regression: round-7 finding (gemini high). The escape-repair regex
+    `\\\\([^"\\\\\\/bfnrtu])` used a char class that excluded backslash, but
+    the engine would still slide one position forward after a no-match and
+    then match the SECOND backslash of a `\\\\` pair with whatever followed.
+    For `C:\\\\Windows` (valid JSON for a Windows path) the regex would
+    match `\\W` at position 1, strip one backslash, and corrupt the valid
+    escape into `C:\\Windows` — which is no longer valid JSON. Fix: walk
+    escapes pair-by-pair so the scanner never lands inside a valid escape.
+
+    This test feeds the repair pipeline a broken JSON where repair would
+    need to run (trailing comma forces _repair_json) AND the valid content
+    contains a `\\\\W` sequence. The path must survive intact."""
+    # Input has a trailing comma (needs repair) and a valid \\\\Windows path.
+    content = r'{"path": "C:\\Windows\\System32",}'
+    result = parse_llm_json(content)
+    assert result is not None
+    assert isinstance(result, dict)
+    # The Python string after json.loads should be the literal path string
+    # with single backslashes (because JSON `\\\\` decodes to `\\` which is
+    # a single backslash in Python).
+    assert result["path"] == r"C:\Windows\System32"
+
+
+def test_unmask_strings_no_collision_with_placeholder_in_restored_content():
+    """Regression: round-7 finding (gemini high). _unmask_strings used a
+    loop of `s.replace(placeholder, original)` calls. If an earlier
+    restored string happened to contain a substring matching a LATER
+    placeholder (e.g. the LLM echoed `@STR_2@` in its prose), the next
+    iteration's `s.replace` would accidentally replace that substring
+    with the wrong string's content. Single-pass `re.sub` scanning
+    eliminates this: each placeholder position in the ORIGINAL masked
+    string is replaced exactly once, and restored content is never
+    re-scanned."""
+    from multi_mcp.utils.json_parser import _mask_strings, _unmask_strings
+
+    # Craft an input where a string literal contains text that looks
+    # like a placeholder. After masking and unmasking, the placeholder-
+    # looking substring inside the restored content must NOT be
+    # re-substituted.
+    original = '{"a": "echoed @STR_1@ placeholder", "b": "second"}'
+    masked, string_map = _mask_strings(original)
+    # Now string_map has two entries: the @STR_0@ placeholder mapped to
+    # `"echoed @STR_1@ placeholder"` and @STR_1@ mapped to `"second"`.
+    # A naive loop-based unmask would:
+    #   1. Replace @STR_0@ with `"echoed @STR_1@ placeholder"` — now s
+    #      contains a literal @STR_1@ substring inside the restored content
+    #   2. Replace @STR_1@ with `"second"` — wrongly touching the content
+    #      we just restored!
+    restored = _unmask_strings(masked, string_map)
+    assert restored == original  # content preserved verbatim
+
+
 def test_parse_does_not_crash_on_deeply_nested_pathological_input():
     """Regression: round-5 re-review finding (gemini critical). The
     _extract_first_json_block function previously caught only
