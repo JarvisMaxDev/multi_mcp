@@ -55,14 +55,19 @@ def _strip_code_fences(s: str) -> str:
     own ```python ... ``` fences, we want to match the OUTERMOST fences, not the first
     closing ``` we encounter.
     """
-    # Use greedy matching (.*?) to get content between outermost fences
-    # This handles nested code fences inside JSON strings
+    # Primary: greedy match anchored at end-of-string (`\s*$`). When the
+    # closing ``` is the very last thing in the input, this locks onto the
+    # OUTERMOST fence pair without being tricked by any inner ```python```
+    # fences the JSON content may carry in its string fields.
     greedy_pattern = re.compile(r"```(?:json|JSON)?\s*([\s\S]*)\s*```\s*$", re.IGNORECASE)
     m = greedy_pattern.search(s)
     if m:
         return m.group(1)
 
-    # Fallback: try non-greedy if greedy didn't work
+    # Fallback: greedy match WITHOUT the end-of-string anchor. Used when the
+    # LLM added trailing prose after the closing fence. Still greedy (see
+    # _CODE_FENCE_RE definition — round-4 made it greedy because the previous
+    # non-greedy version truncated at the first inner ```python``` fence).
     m = _CODE_FENCE_RE.search(s)
     if m:
         return m.group(1)
@@ -442,8 +447,39 @@ def parse_llm_json(text: str) -> Any | None:
         except Exception:
             pass  # fall through to the unwrapping pipeline below
 
-    raw = _strip_analysis_blocks(text)
-    raw = _strip_code_fences(raw)
+    # First attempt: parse WITHOUT stripping analysis blocks. The analysis
+    # stripper is designed to handle LLM outputs that wrap reasoning in
+    # `<analysis>...</analysis>` tags preceding the real JSON, but it's a
+    # text-level regex — it doesn't know whether `<analysis>` is a wrapper
+    # OR legitimate string content inside a valid JSON field (e.g.
+    # `{"fix": "<analysis>keep</analysis>"}`). Running it before parsing
+    # destroys that legitimate content. So: try the full parse pipeline on
+    # the untouched text first, and only fall back to analysis-stripping
+    # if nothing else works.
+    parsed = _try_parse_candidate(text)
+    if parsed is not None:
+        return parsed
+
+    # Fallback: the LLM probably wrapped its JSON in `<analysis>...</analysis>`
+    # reasoning tags. Strip them and re-run the pipeline. Only reached when
+    # the unmodified text genuinely couldn't be parsed — which means the
+    # analysis blocks were structural wrappers, not string content.
+    analysis_stripped = _strip_analysis_blocks(text)
+    if analysis_stripped != text:
+        return _try_parse_candidate(analysis_stripped)
+
+    return None
+
+
+def _try_parse_candidate(text: str) -> Any | None:
+    """Run the full fence-strip + direct-parse + repair + block-extract pipeline.
+
+    Shared by ``parse_llm_json`` so the main function can run this pipeline
+    twice — once on the raw text (to preserve legitimate `<analysis>` string
+    content) and once on analysis-stripped text (to rescue outputs where
+    `<analysis>` was actually a wrapper).
+    """
+    raw = _strip_code_fences(text)
     candidate = raw.strip()
 
     # Try direct parse on the unwrapped content first.

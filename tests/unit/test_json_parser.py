@@ -178,6 +178,48 @@ def test_parse_prefers_earliest_non_empty_block_over_later_longer_one():
     assert "a" not in result
 
 
+def test_parse_preserves_legitimate_analysis_strings_in_json_fields():
+    """Regression: round-8 finding (codex medium). parse_llm_json used to
+    run _strip_analysis_blocks on the raw text BEFORE attempting to parse,
+    to handle LLM outputs that wrap reasoning in <analysis>...</analysis>
+    tags preceding the real JSON. But the stripper is a text-level regex
+    — it has no way to tell whether `<analysis>` is a structural wrapper
+    OR legitimate string content inside a valid JSON field. As a result,
+    any valid JSON containing `<analysis>...</analysis>` substrings in its
+    string values would have those substrings silently destroyed.
+
+    Self-referential bonus: the round-8 review that surfaced this bug
+    returned a "Failed to parse" warning on codex's own output, because
+    codex's JSON response literally contained the example string
+    `"<analysis>keep</analysis>"` to document the bug — and our parser
+    stripped it, corrupting the JSON that described the corruption.
+
+    Fix: run the full parse pipeline on the untouched text first, and
+    only fall back to analysis-stripping if the raw-text pipeline
+    returned None (meaning the analysis blocks really WERE structural
+    wrappers, not string content).
+    """
+    # Case 1: JSON with <analysis> tag inside a string field must be
+    # preserved verbatim because the raw text parses fine.
+    content = 'prefix {"fix": "<analysis>keep</analysis>", "status": "ok"} suffix'
+    result = parse_llm_json(content)
+    assert result is not None
+    assert result["fix"] == "<analysis>keep</analysis>"
+    assert result["status"] == "ok"
+
+    # Case 2: The legacy use case — LLM wrapped its reasoning in
+    # <analysis> tags as a PREAMBLE before the JSON. The stripper
+    # fallback must still handle this.
+    content2 = (
+        "<analysis>This is my reasoning about the input</analysis>\n"
+        '{"status": "ok", "message": "done"}'
+    )
+    result2 = parse_llm_json(content2)
+    assert result2 is not None
+    assert result2["status"] == "ok"
+    assert result2["message"] == "done"
+
+
 def test_repair_preserves_valid_backslash_escapes_in_paths():
     """Regression: round-7 finding (gemini high). The escape-repair regex
     `\\\\([^"\\\\\\/bfnrtu])` used a char class that excluded backslash, but
