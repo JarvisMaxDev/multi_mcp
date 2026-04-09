@@ -123,17 +123,15 @@ def test_parse_outer_json_with_trailing_comma_and_nested_fence():
     assert "```json" in result["fix"]
 
 
-def test_parse_prefers_longest_block_over_accidental_empty_brackets():
-    """Regression: round-5 finding. Round-4 made _extract_first_json_block
-    iterate over every bracket position and return the FIRST parseable block,
-    assuming "parseable == intended". But prose frequently contains tokens
-    like `messages[].content` or `dict{}` that form balanced EMPTY brackets
-    which happen to be valid JSON (`[]` / `{}`). The parser would extract the
-    accidental empty container, codereview.py would reject it via
-    `if not parsed_json` because empty containers are falsy, and the real
-    JSON later in the text would be lost under a misleading "Failed to parse"
-    warning. Fix: prefer the LONGEST parseable block — real payloads are
-    almost always larger than prose artifacts."""
+def test_parse_skips_accidental_empty_brackets_in_prose():
+    """Regression: round-5 original finding. Prose with tokens like
+    `messages[].content` or `dict{}` forms accidental balanced empty
+    containers (`[]` / `{}`) that parse as valid (but empty) JSON. The
+    parser must skip these and find the real payload later in the text.
+    Round-5 fix used "longest parseable"; round-6 fix switched to "first
+    non-empty parseable" because "longest" regressed envelope-then-example
+    scenarios. Either strategy handles this test correctly, but the test
+    name now reflects the intent rather than the algorithm."""
     content = (
         "Проверяю межфайловую совместимость: какие формы "
         "`messages[].content` реально строятся в проекте. "
@@ -147,13 +145,60 @@ def test_parse_prefers_longest_block_over_accidental_empty_brackets():
     assert result["message"] == "all checks passed"
 
 
-def test_parse_returns_legitimate_empty_container_when_nothing_larger():
-    """Counter-regression for the "prefer longest" fix: if the ONLY parseable
-    block is a legitimate empty `[]` or `{}`, still return it. The "prefer
-    longest" rule must degrade gracefully to "the only one that parses" when
-    there's no larger alternative."""
+def test_parse_returns_legitimate_empty_container_when_nothing_else_parses():
+    """Counter-regression: if the ONLY parseable block is a legitimate empty
+    `[]` or `{}`, still return it. The "first non-empty" rule must degrade
+    gracefully to "the only thing that parses" when there's no non-empty
+    alternative — otherwise APIs that legitimately return empty responses
+    would be misparsed as None."""
     assert parse_llm_json("API returned: []") == []
     assert parse_llm_json("response: {}") == {}
+
+
+def test_parse_prefers_earliest_non_empty_block_over_later_longer_one():
+    """Regression: round-5 re-review finding (codex high). The round-5 fix
+    used "longest parseable block" to skip accidental empty brackets in
+    prose. But "longest" introduced a NEW regression: if an LLM returned
+    the expected envelope first and then a longer JSON example later in the
+    prose (rare but possible in verbose codex/gemini outputs), "longest"
+    would pick the example and lose the envelope — breaking the cross-file
+    contract with codereview.py which expects {status, issues_found} shape.
+    Round-6 fix: return the FIRST non-empty parseable block (envelope comes
+    first in iteration order), empty containers held only as fallback."""
+    content = (
+        '{"status": "ok", "message": "found 0 issues"}'
+        "\n\nFor reference, here is a longer example payload:\n"
+        '{"a": 1, "b": 2, "c": 3, "nested": {"deep": {"very": "deep"}}}'
+    )
+    result = parse_llm_json(content)
+    assert result is not None
+    assert result.get("status") == "ok"
+    # Critical: we took the envelope, not the longer example
+    assert "nested" not in result
+    assert "a" not in result
+
+
+def test_parse_does_not_crash_on_deeply_nested_pathological_input():
+    """Regression: round-5 re-review finding (gemini critical). The
+    _extract_first_json_block function previously caught only
+    json.JSONDecodeError. Deeply nested pathological input (e.g.
+    `[[[[...` repeated past Python's recursion limit) triggers
+    RecursionError inside json.loads — which ISN'T a JSONDecodeError
+    subclass, so it escaped the narrow except and crashed the server.
+    Same issue affected the fast path in parse_llm_json. Round-6 fix:
+    broaden all except clauses from json.JSONDecodeError to Exception.
+    LLM output can be adversarial or accidentally malformed; the
+    correct response is graceful degradation, not a server crash."""
+    # Nesting depth well above Python's default recursion limit (1000).
+    # json.loads recursion is proportional to nesting depth.
+    content = "[" * 2000 + "]" * 2000
+    # Must not raise — the test passes simply by reaching the next line
+    # without an exception being propagated.
+    result = parse_llm_json(content)
+    # The return value itself is not important for this regression test;
+    # what matters is that NO exception (RecursionError, MemoryError, etc.)
+    # escapes the parser. None or a nested list are both acceptable.
+    assert result is None or isinstance(result, list)
 
 
 def test_parse_negative_infinity_via_single_substitution():

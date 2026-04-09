@@ -214,75 +214,101 @@ def _unmask_strings(s: str, strings: dict[str, str]) -> str:
     return s
 
 
-def _extract_first_json_block(s: str) -> str | None:
-    """Extract the longest parseable JSON object or array from a string.
+def _scan_balanced_block(s: str, start: int) -> str | None:
+    """Return the balanced bracket block starting at position `start`.
 
-    Iterates over every `{` and `[` position in the string, tries to extract a
-    balanced block starting there, and returns the LONGEST one that successfully
-    parses as JSON (or parses after repair).
-
-    Why "longest" instead of "first": prose text routinely contains tokens like
-    ``messages[].content`` or ``dict{}`` that happen to form balanced empty
-    brackets. A strict first-match policy would extract the accidental `[]` /
-    `{}` from the prose, json.loads would happily accept it as a valid empty
-    container, and the real JSON later in the string would be lost. By picking
-    the longest block we prefer substantive content over accidental empty
-    containers — the intended payload is almost always larger than any prose
-    artifact.
-
-    If the input is a legitimate `{}` / `[]` and nothing else parses, that
-    empty container is still returned (it's the longest-and-only match).
-
-    Handles nested braces/brackets and string escaping inside JSON strings.
+    Assumes `s[start]` is `{` or `[`. Walks forward, tracking depth and
+    string-literal state (so brackets inside strings don't affect depth),
+    and returns the substring covering the opening bracket through the
+    matching closing bracket. Returns None if the string ends before the
+    block is closed.
     """
-    best_block: str | None = None
+    opener = s[start]
+    closer = "}" if opener == "{" else "]"
+
+    depth = 0
+    in_str = False
+    esc = False
+    quote_char = ""
+
+    for i in range(start, len(s)):
+        c = s[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == quote_char:
+                in_str = False
+            continue
+        if c in ('"', "'"):
+            in_str = True
+            quote_char = c
+        elif c == opener:
+            depth += 1
+        elif c == closer:
+            depth -= 1
+            if depth == 0:
+                return s[start : i + 1]
+    return None
+
+
+def _try_parse_block(block: str) -> tuple[bool, object]:
+    """Try to parse `block` as JSON, with a repair fallback.
+
+    Returns (True, parsed_value) on success or (False, None) on failure.
+    Catches broad `Exception` because deeply nested pathological input can
+    raise `RecursionError` from `json.loads` — we want graceful degradation
+    to None, not a propagated crash.
+    """
+    try:
+        return True, json.loads(block)
+    except Exception:
+        try:
+            return True, json.loads(_repair_json(block))
+        except Exception:
+            return False, None
+
+
+def _extract_first_json_block(s: str) -> str | None:
+    """Extract the first non-empty parseable JSON object or array from a string.
+
+    Iterates over every `{` and `[` position in the string, extracts the
+    balanced block starting there via ``_scan_balanced_block``, and returns
+    the FIRST block that both (a) parses as JSON (or parses after repair)
+    AND (b) is not an empty container. If only empty blocks parse, returns
+    the first empty `{}` / `[]` block instead. Returns None only if nothing
+    parses at all.
+
+    Why "first non-empty" (vs "first parseable" or "longest parseable"):
+    - "First parseable" is too greedy: prose tokens like ``messages[].content``
+      form accidental balanced empty containers that parse as valid empty
+      JSON, masking real payloads later in the string (round-5 original bug).
+    - "Longest parseable" (round-5 fix) broke the envelope-then-example case:
+      if an LLM returns a status envelope first and includes a longer JSON
+      example later in its prose, "longest" would pick the example and lose
+      the envelope (round-5 re-review regression, flagged by codex-cli).
+    - "First non-empty" resolves both cases: skips accidental empty
+      containers AND picks the envelope over any later example.
+    """
+    first_empty: str | None = None
 
     for start in range(len(s)):
-        ch = s[start]
-        if ch not in "{[":
+        if s[start] not in "{[":
             continue
-        opener = ch
-        closer = "}" if opener == "{" else "]"
+        block = _scan_balanced_block(s, start)
+        if block is None:
+            continue
+        parsed_ok, parsed = _try_parse_block(block)
+        if not parsed_ok:
+            continue
+        if parsed == {} or parsed == []:
+            if first_empty is None:
+                first_empty = block
+        else:
+            return block
 
-        depth = 0
-        in_str = False
-        esc = False
-        quote_char = ""
-
-        for i in range(start, len(s)):
-            c = s[i]
-            if in_str:
-                if esc:
-                    esc = False
-                elif c == "\\":
-                    esc = True
-                elif c == quote_char:
-                    in_str = False
-            else:
-                if c in ('"', "'"):
-                    in_str = True
-                    quote_char = c
-                elif c == opener:
-                    depth += 1
-                elif c == closer:
-                    depth -= 1
-                    if depth == 0:
-                        block = s[start : i + 1]
-                        parses = False
-                        try:
-                            json.loads(block)
-                            parses = True
-                        except json.JSONDecodeError:
-                            try:
-                                json.loads(_repair_json(block))
-                                parses = True
-                            except json.JSONDecodeError:
-                                pass
-                        if parses and (best_block is None or len(block) > len(best_block)):
-                            best_block = block
-                        break  # done with this start position
-
-    return best_block
+    return first_empty
 
 
 def _repair_json(s: str) -> str:
@@ -375,13 +401,16 @@ def parse_llm_json(text: str) -> Any | None:
     # `{"session_id": "...", "response": "### text\n```json\n[...]\n```"}`)
     # and incorrectly extract the inner code fence instead of returning the outer
     # object. We only fall through to fence-stripping when the raw parse fails.
-    # We catch JSONDecodeError specifically — unrelated errors (RecursionError on
-    # pathological input, MemoryError, etc.) should propagate so real bugs surface.
+    # We catch broad Exception here (not just JSONDecodeError) because deeply
+    # nested pathological input can raise RecursionError from json.loads, which
+    # would otherwise escape and crash the caller. LLM output can be adversarial
+    # or accidentally malformed — better to gracefully degrade to the unwrapping
+    # pipeline (and ultimately None) than to propagate a crash.
     stripped_input = text.strip()
     if stripped_input.startswith(("{", "[")):
         try:
             return json.loads(stripped_input)
-        except json.JSONDecodeError:
+        except Exception:
             pass
         # Try the repair pipeline on the OUTER document before any destructive
         # fence stripping. This rescues "almost-valid" wrapper JSON (e.g. with a
@@ -390,7 +419,7 @@ def parse_llm_json(text: str) -> Any | None:
         # reach into the string and pull out the inner block.
         try:
             return json.loads(_repair_json(stripped_input))
-        except json.JSONDecodeError:
+        except Exception:
             pass  # fall through to the unwrapping pipeline below
 
     raw = _strip_analysis_blocks(text)
@@ -410,13 +439,19 @@ def parse_llm_json(text: str) -> Any | None:
     except Exception:
         pass
 
-    # Last resort: extract a JSON block from anywhere in the candidate. This
-    # handles cases like `Here is the result: {"ok": true} (timestamp: ...)`
+    # Last resort: extract a JSON block from anywhere in the (repaired) text.
+    # This handles cases like `Here is the result: {"ok": true} (timestamp: ...)`
     # where the JSON is embedded in surrounding prose, OR cases where the
     # input has a leading non-JSON bracket fragment like `[tag] {real json}`.
-    # We always run this even if the candidate starts with `{`/`[` because the
-    # direct parse may have failed due to trailing garbage.
-    block = _extract_first_json_block(candidate)
+    # We run this even if the candidate starts with `{`/`[` because the direct
+    # parse may have failed due to trailing garbage.
+    #
+    # We pass `repaired` (not `candidate`) because the repair pipeline already
+    # normalized obvious issues like comments, single quotes and trailing
+    # commas. Running the block extractor on the raw candidate would hand the
+    # naive brace counter a more hostile input (e.g. unmatched braces hidden
+    # inside `// comment` lines).
+    block = _extract_first_json_block(repaired)
     if block is not None:
         try:
             return json.loads(block)
