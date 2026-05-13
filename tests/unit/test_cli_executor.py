@@ -187,9 +187,7 @@ class TestCLIExecutor:
             cli_executor._parse_output(stdout, "json")
 
     @pytest.mark.asyncio
-    async def test_execute_surfaces_claude_application_error_cleanly(
-        self, cli_executor, cli_model_config
-    ):
+    async def test_execute_surfaces_claude_application_error_cleanly(self, cli_executor, cli_model_config):
         """When Claude CLI reports is_error=true, execute() must return a clean error
         response — not a misleading 'CLI execution failed: ValueError: ...' wrapper.
 
@@ -199,9 +197,7 @@ class TestCLIExecutor:
         """
         mock_process = MagicMock()
         mock_process.returncode = 0
-        mock_process.communicate = AsyncMock(
-            return_value=(b'{"result": "rate limit exceeded", "is_error": true}', b"")
-        )
+        mock_process.communicate = AsyncMock(return_value=(b'{"result": "rate limit exceeded", "is_error": true}', b""))
 
         with (
             patch("shutil.which", return_value="/usr/bin/claude"),
@@ -381,9 +377,7 @@ class TestCLIExecutor:
     @pytest.mark.asyncio
     async def test_format_messages_as_prompt_single_user(self, cli_executor):
         """Single user message serializes with role marker."""
-        result = cli_executor._format_messages_as_prompt(
-            [{"role": "user", "content": "Hello"}]
-        )
+        result = cli_executor._format_messages_as_prompt([{"role": "user", "content": "Hello"}])
         assert result == "[USER]\nHello"
 
     @pytest.mark.asyncio
@@ -395,9 +389,7 @@ class TestCLIExecutor:
     @pytest.mark.asyncio
     async def test_format_messages_as_prompt_none_content(self, cli_executor):
         """None content must become an empty string, not the literal 'None'."""
-        result = cli_executor._format_messages_as_prompt(
-            [{"role": "user", "content": None}]
-        )
+        result = cli_executor._format_messages_as_prompt([{"role": "user", "content": None}])
         assert result == "[USER]\n"
         assert "None" not in result  # the literal word "None" must NOT appear
 
@@ -478,6 +470,172 @@ class TestCLIExecutor:
         reparsed = _json.loads(result)
         assert reparsed == [1, 2, 3]
 
+    # ---- Qwen CLI: --output-format json emits a heterogeneous event array ---
+
+    def test_parse_output_json_qwen_array_format(self, cli_executor):
+        """Qwen array: final answer lives in the last `type:'result'` event's `result` field."""
+        stdout = (
+            '[{"type":"system","subtype":"session_start","model":"qwen3"},'
+            '{"type":"assistant","message":{"content":[{"type":"text","text":"thinking..."}]}},'
+            '{"type":"result","subtype":"success","is_error":false,"result":"Qwen final answer"}]'
+        )
+        result = cli_executor._parse_output(stdout, "json")
+        assert result == "Qwen final answer"
+
+    def test_parse_output_json_qwen_error_in_result_field(self, cli_executor):
+        """Qwen `is_error: true` with message in `result` → ValueError using that message."""
+        stdout = '[{"type":"result","is_error":true,"result":"auth failed: invalid api key"}]'
+        with pytest.raises(ValueError, match="Qwen CLI error: auth failed"):
+            cli_executor._parse_output(stdout, "json")
+
+    def test_parse_output_json_qwen_error_in_error_field(self, cli_executor):
+        """Qwen `is_error: true` without `result` but with `error` → ValueError uses `error`."""
+        stdout = '[{"type":"result","is_error":true,"error":"tool exec failed","subtype":"tool_error"}]'
+        with pytest.raises(ValueError, match="Qwen CLI error: tool exec failed"):
+            cli_executor._parse_output(stdout, "json")
+
+    def test_parse_output_json_qwen_error_no_message(self, cli_executor):
+        """Qwen `is_error: true` with no string fields → ValueError with 'unknown failure'."""
+        stdout = '[{"type":"result","is_error":true}]'
+        with pytest.raises(ValueError, match="Qwen CLI error: unknown failure"):
+            cli_executor._parse_output(stdout, "json")
+
+    def test_parse_output_json_qwen_assistant_fallback(self, cli_executor):
+        """Empty/missing `result` field → fall back to last assistant `content[].text`."""
+        stdout = (
+            '[{"type":"system","subtype":"session_start"},'
+            '{"type":"assistant","message":{"content":['
+            '{"type":"text","text":"first chunk"},'
+            '{"type":"text","text":"second chunk"}'
+            "]}},"
+            '{"type":"result","subtype":"success","is_error":false,"result":""}]'
+        )
+        result = cli_executor._parse_output(stdout, "json")
+        assert result == "first chunk\nsecond chunk"
+
+    def test_parse_output_json_qwen_assistant_fallback_no_result_event(self, cli_executor):
+        """No `type:'result'` event at all → assistant text fallback still works."""
+        stdout = (
+            '[{"type":"system","subtype":"session_start"},'
+            '{"type":"assistant","message":{"content":[{"type":"text","text":"only assistant"}]}}]'
+        )
+        result = cli_executor._parse_output(stdout, "json")
+        assert result == "only assistant"
+
+    def test_parse_output_json_qwen_picks_last_result(self, cli_executor):
+        """Multiple `type:'result'` events → use the last (final) one."""
+        stdout = (
+            '[{"type":"result","is_error":false,"result":"intermediate"},'
+            '{"type":"assistant","message":{"content":[{"type":"text","text":"more"}]}},'
+            '{"type":"result","is_error":false,"result":"final"}]'
+        )
+        result = cli_executor._parse_output(stdout, "json")
+        assert result == "final"
+
+    def test_parse_output_json_qwen_nested_result(self, cli_executor):
+        """Qwen `result` as object/list (defensive) → re-serialize as JSON string."""
+        stdout = '[{"type":"result","is_error":false,"result":{"answer":42,"ok":true}}]'
+        result = cli_executor._parse_output(stdout, "json")
+        assert isinstance(result, str)
+        import json as _json
+
+        reparsed = _json.loads(result)
+        assert reparsed == {"answer": 42, "ok": True}
+
+    def test_parse_output_json_qwen_no_usable_content(self, cli_executor):
+        """No result event and no assistant text → re-serialize whole array for debug."""
+        stdout = '[{"type":"system","subtype":"session_start"},{"type":"tool_call","name":"foo"}]'
+        result = cli_executor._parse_output(stdout, "json")
+        assert isinstance(result, str)
+        import json as _json
+
+        reparsed = _json.loads(result)
+        assert isinstance(reparsed, list)
+        assert reparsed[0]["type"] == "system"
+
+    def test_get_install_hint_qwen(self, cli_executor):
+        """Install hint for Qwen Code CLI must reference its npm package."""
+        hint = cli_executor.get_install_hint("qwen")
+        assert "npm install" in hint
+        assert "@qwen-code/qwen-code" in hint
+
+    @pytest.mark.asyncio
+    async def test_execute_qwen_cli_basic_execution(self, cli_executor):
+        """End-to-end execute() with a qwen-shaped config and array JSON stdout."""
+        qwen_config = ModelConfig(
+            provider="cli",
+            cli_command="qwen",
+            cli_args=["--output-format", "json", "--approval-mode", "auto-edit"],
+            cli_parser="json",
+            cli_env={},
+        )
+        qwen_output = (
+            b'[{"type":"system","subtype":"session_start","model":"glm-5.1:cloud"},'
+            b'{"type":"assistant","message":{"content":[{"type":"text","text":"hi"}]}},'
+            b'{"type":"result","subtype":"success","is_error":false,"result":"Hello from qwen"}]'
+        )
+        mock_process = MagicMock()
+        mock_process.returncode = 0
+        mock_process.communicate = AsyncMock(return_value=(qwen_output, b""))
+
+        with (
+            patch("shutil.which", return_value="/opt/homebrew/bin/qwen"),
+            patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
+            patch("multi_mcp.models.cli_executor.log_llm_interaction"),
+        ):
+            mock_exec.return_value = mock_process
+            result = await cli_executor.execute(
+                canonical_name="qwen-cli",
+                model_config=qwen_config,
+                messages=[{"role": "user", "content": "say hi"}],
+            )
+
+            assert result.status == "success"
+            assert result.content == "Hello from qwen"
+            assert result.metadata.model == "qwen-cli"
+
+    @pytest.mark.asyncio
+    async def test_execute_qwen_cli_surfaces_application_error_cleanly(self, cli_executor):
+        """Qwen `is_error: true` must surface as a clean error response, not 'CLI execution failed'.
+
+        Parity with the Claude CLI is_error contract — the subprocess succeeded
+        (exit 0), only the model reported a problem, so wrap it as application
+        error rather than runtime crash.
+        """
+        qwen_config = ModelConfig(
+            provider="cli",
+            cli_command="qwen",
+            cli_args=[],
+            cli_parser="json",
+            cli_env={},
+        )
+        mock_process = MagicMock()
+        mock_process.returncode = 0
+        mock_process.communicate = AsyncMock(
+            return_value=(
+                b'[{"type":"result","subtype":"error","is_error":true,"result":"model overloaded"}]',
+                b"",
+            )
+        )
+
+        with (
+            patch("shutil.which", return_value="/opt/homebrew/bin/qwen"),
+            patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
+            patch("multi_mcp.models.cli_executor.log_llm_interaction"),
+        ):
+            mock_exec.return_value = mock_process
+            result = await cli_executor.execute(
+                canonical_name="qwen-cli",
+                model_config=qwen_config,
+                messages=[{"role": "user", "content": "test"}],
+            )
+
+            assert result.status == "error"
+            assert "model overloaded" in result.error
+            assert "Qwen CLI error" in result.error
+            assert "CLI execution failed" not in result.error
+            assert "ValueError" not in result.error
+
     def test_expand_env_vars_resolves_nested_references(self, cli_executor):
         """_expand_env_vars should resolve multi-level ${VAR} references by iterating."""
         env = {
@@ -512,9 +670,7 @@ class TestCLIExecutor:
         assert result == "${MISSING}"
 
     @pytest.mark.asyncio
-    async def test_execute_cli_env_expansion_is_order_independent(
-        self, cli_executor, mock_subprocess_success
-    ):
+    async def test_execute_cli_env_expansion_is_order_independent(self, cli_executor, mock_subprocess_success):
         """Regression: codex round-3 finding. cli_env expansion used to iterate
         in YAML insertion order, so `A=${B}` declared before `B=value` would
         leave A unresolved. Build a stable lookup map upfront so cross-key
@@ -546,9 +702,7 @@ class TestCLIExecutor:
             assert env["B"] == "resolved_value"
 
     @pytest.mark.asyncio
-    async def test_execute_tolerates_process_lookup_error_on_cleanup(
-        self, cli_executor, cli_model_config
-    ):
+    async def test_execute_tolerates_process_lookup_error_on_cleanup(self, cli_executor, cli_model_config):
         """Regression: codex round-3 finding. After process.kill(), the child
         may have already exited (race window between returncode check and kill),
         so kill() can raise ProcessLookupError. The cleanup helper must catch it
@@ -576,9 +730,7 @@ class TestCLIExecutor:
             mock_process.kill.assert_called_once()  # cleanup was attempted
 
     @pytest.mark.asyncio
-    async def test_execute_preflight_honors_cli_env_path_override(
-        self, cli_executor, mock_subprocess_success
-    ):
+    async def test_execute_preflight_honors_cli_env_path_override(self, cli_executor, mock_subprocess_success):
         """Round-4 finding (codex medium): the shutil.which preflight used to
         consult os.environ PATH only, ignoring any PATH override declared in
         cli_env. So a CLI binary that's only reachable via a custom PATH would
@@ -618,9 +770,7 @@ class TestCLIExecutor:
             assert result.status == "success"
 
     @pytest.mark.asyncio
-    async def test_execute_cancellation_kills_subprocess_and_propagates(
-        self, cli_executor, cli_model_config
-    ):
+    async def test_execute_cancellation_kills_subprocess_and_propagates(self, cli_executor, cli_model_config):
         """Regression: gemini round-3 finding (CRITICAL). When the asyncio task
         is cancelled (client disconnect, parent task cancel), the subprocess
         must be killed so it doesn't leak as an orphan, AND the CancelledError

@@ -69,6 +69,15 @@ class CLIExecutor:
             env["GEMINI_API_KEY"] = settings.gemini_api_key
         if settings.openrouter_api_key:
             env["OPENROUTER_API_KEY"] = settings.openrouter_api_key
+        # CLI-only keys: forwarded to subprocess env so qwen-cli (which talks
+        # to Ollama / LM Studio / DashScope via its OpenAI-compatible mode)
+        # finds the credential its modelProviders entry references.
+        if settings.ollama_api_key:
+            env["OLLAMA_API_KEY"] = settings.ollama_api_key
+        if settings.lm_studio_api_key:
+            env["LM_STUDIO_API_KEY"] = settings.lm_studio_api_key
+        if settings.dashscope_api_key:
+            env["DASHSCOPE_API_KEY"] = settings.dashscope_api_key
 
         # Now expand variables in cli_env (e.g., ${ANTHROPIC_API_KEY}).
         # Build a stable lookup map that contains all cli_env keys upfront so
@@ -278,6 +287,7 @@ class CLIExecutor:
             "gemini": "Install via: npm install -g @google/gemini-cli",
             "codex": "Install via: npm install -g @openai/codex",
             "claude": "Install via: npm install -g @anthropic-ai/claude-code",
+            "qwen": "Install via: npm install -g @qwen-code/qwen-code@latest (or: brew install qwen-code)",
         }
         return hints.get(cli_command, f"Ensure '{cli_command}' is installed and in PATH")
 
@@ -295,6 +305,12 @@ class CLIExecutor:
             # Use existing robust JSON parser (handles malformed JSON)
             parsed = parse_llm_json(stdout)
             if parsed is not None:
+                # Qwen CLI emits an array of message events; the final answer
+                # lives in the last element with type=="result". Handle this
+                # before the dict branch so gemini/claude (dict-shaped output)
+                # remain unaffected.
+                if isinstance(parsed, list):
+                    return self._parse_qwen_event_array(parsed)
                 # Extract content based on CLI format
                 if isinstance(parsed, dict):
                     # Claude CLI format: check for errors first
@@ -354,9 +370,69 @@ class CLIExecutor:
             return stdout.strip()
 
     @staticmethod
-    async def _terminate_subprocess(
-        process: asyncio.subprocess.Process | None, reason: str
-    ) -> None:
+    def _parse_qwen_event_array(events: list) -> str:
+        """Extract the final answer from a Qwen Code `--output-format json` array.
+
+        Qwen emits a heterogeneous event list (session_start, assistant turns,
+        tool calls, ..., then a terminal `type:"result"` event). The contract
+        is: pick the last `type:"result"` and read its `result` field; on
+        `is_error: true` raise so the caller surfaces it as an application
+        error (parity with the Claude `is_error` branch in the dict path).
+
+        If the result event is missing or empty (defensive — docs around
+        partial-content events are inconsistent across versions), fall back to
+        the last assistant message's text parts. Re-serialize the whole array
+        as the final fallback so the raw output remains debuggable.
+        """
+        # Pass 1: find the terminal result event and try to use it
+        result_event: dict | None = None
+        for event in reversed(events):
+            if isinstance(event, dict) and event.get("type") == "result":
+                result_event = event
+                break
+
+        if result_event is not None:
+            if result_event.get("is_error"):
+                # Error messages may surface under several keys depending on the
+                # failure mode (auth, tool, model). Try them in priority order
+                # so users see something specific rather than "Unknown error".
+                for key in ("result", "error", "message", "subtype"):
+                    val = result_event.get(key)
+                    if isinstance(val, str) and val:
+                        raise ValueError(f"Qwen CLI error: {val}")
+                raise ValueError("Qwen CLI error: unknown failure (no error message in result event)")
+
+            result_val = result_event.get("result")
+            if isinstance(result_val, str) and result_val:
+                return result_val
+            if result_val is not None and not isinstance(result_val, str):
+                # Defensive: result is a dict/list (shouldn't happen per docs)
+                return json.dumps(result_val, ensure_ascii=False)
+            # result is empty/None — fall through to assistant fallback
+
+        # Pass 2: last assistant message text (in case result event is missing
+        # or has an empty result — e.g., some headless modes only emit assistant
+        # turns without a terminal result event).
+        for event in reversed(events):
+            if not isinstance(event, dict) or event.get("type") != "assistant":
+                continue
+            message = event.get("message")
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content")
+            if isinstance(content, list):
+                text_parts = [part.get("text", "") for part in content if isinstance(part, dict) and part.get("type") == "text"]
+                joined = "\n".join(t for t in text_parts if t)
+                if joined:
+                    return joined
+
+        # Last resort: surface the whole array so the failure mode is visible
+        # in logs. Better than silently returning empty content.
+        logger.warning("[CLI_PARSE] Qwen event array had no usable result or assistant text")
+        return json.dumps(events, ensure_ascii=False)
+
+    @staticmethod
+    async def _terminate_subprocess(process: asyncio.subprocess.Process | None, reason: str) -> None:
         """Best-effort kill + bounded drain of a subprocess pipe.
 
         Used by all execute() exception branches (timeout, cancellation, generic
@@ -376,19 +452,13 @@ class CLIExecutor:
         except ProcessLookupError:
             logger.debug(f"[CLI_CALL] {reason} CLI process exited before kill()")
         except Exception:
-            logger.debug(
-                f"[CLI_CALL] Error sending kill() to {reason} CLI process", exc_info=True
-            )
+            logger.debug(f"[CLI_CALL] Error sending kill() to {reason} CLI process", exc_info=True)
         try:
             await asyncio.wait_for(process.communicate(), timeout=5.0)
         except TimeoutError:
-            logger.warning(
-                f"[CLI_CALL] {reason} CLI process did not exit cleanly within 5s after kill()"
-            )
+            logger.warning(f"[CLI_CALL] {reason} CLI process did not exit cleanly within 5s after kill()")
         except Exception:
-            logger.debug(
-                f"[CLI_CALL] Error while draining {reason} CLI process", exc_info=True
-            )
+            logger.debug(f"[CLI_CALL] Error while draining {reason} CLI process", exc_info=True)
 
     @staticmethod
     def _format_messages_as_prompt(messages: list[dict]) -> str:
@@ -451,11 +521,7 @@ class CLIExecutor:
                 if isinstance(part, str):
                     text_parts.append(part)
                 # Anthropic / OpenAI style: {"type": "text", "text": "..."}
-                elif (
-                    isinstance(part, dict)
-                    and part.get("type") == "text"
-                    and isinstance(part.get("text"), str)
-                ):
+                elif isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str):
                     text_parts.append(part["text"])
             return "\n".join(text_parts)
         # Fallback: serialize as JSON (not Python repr — json.dumps uses double quotes

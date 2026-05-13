@@ -4,8 +4,10 @@ These tests verify that CLIs are actually working end-to-end.
 Only 2 tests per CLI - basic execution and alias resolution.
 
 Requirements:
-- Real CLI tools installed (claude, gemini, codex)
+- Real CLI tools installed (claude, gemini, codex, qwen)
 - API keys configured in environment
+- For qwen-cli: ~/.qwen/settings.json with auth + modelProviders preset
+  (multi_mcp does NOT inject credentials — qwen reads its own config)
 - Set RUN_E2E=1 to run these tests
 
 Run with:
@@ -117,3 +119,41 @@ async def test_codex_cli_alias_smoke(require_cli):
     assert result.status == "success", f"Expected success, got: {result.error}"
     assert result.content, "Response content should not be empty"
     assert result.metadata.model == "codex-cli"
+
+
+@pytest.mark.integration
+async def test_qwen_cli_basic_smoke(require_cli):
+    """Smoke test: Qwen CLI basic execution.
+
+    Requires ~/.qwen/settings.json with selectedType + modelProviders configured.
+    multi_mcp passes no credentials — qwen reads its own settings.json and .env.
+    """
+    require_cli("qwen")
+
+    from multi_mcp.utils.llm_runner import execute_single
+
+    result = await execute_single(
+        model="qwen-cli",
+        messages=[{"role": "user", "content": "Say 'CLI working'"}],
+    )
+
+    assert result.status == "success", f"Expected success, got: {result.error}"
+    assert result.content, "Response content should not be empty"
+    assert result.metadata.model == "qwen-cli"
+
+
+@pytest.mark.integration
+async def test_qwen_cli_alias_smoke(require_cli):
+    """Smoke test: Qwen CLI with alias."""
+    require_cli("qwen")
+
+    from multi_mcp.utils.llm_runner import execute_single
+
+    result = await execute_single(
+        model="qw-cli",  # Using alias
+        messages=[{"role": "user", "content": "Say 'Alias working'"}],
+    )
+
+    assert result.status == "success", f"Expected success, got: {result.error}"
+    assert result.content, "Response content should not be empty"
+    assert result.metadata.model == "qwen-cli"

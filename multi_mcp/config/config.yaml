@@ -256,6 +256,21 @@ models:
       - cl-cli
     notes: "Claude CLI with acceptEdits permission mode, using Haiku for cost efficiency"
 
+  qwen-cli:
+    provider: cli
+    cli_command: qwen
+    cli_args:
+      - "--output-format"
+      - "json"
+      - "--approval-mode"
+      - "auto-edit"  # Auto-approve edits, ask on shell (note: hyphen, not underscore)
+      # - "--yolo"  # Most dangerous: auto-approve ALL tool calls including shell
+    cli_env: {}  # qwen loads its own ~/.qwen/settings.json (modelProviders) and ~/.qwen/.env
+    cli_parser: json
+    aliases:
+      - qw-cli
+    notes: "Qwen Code CLI. Model and auth configured via ~/.qwen/settings.json (modelProviders)."
+
   # ============================================
   # AWS Bedrock Models
   # ============================================

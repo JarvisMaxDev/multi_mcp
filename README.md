@@ -274,6 +274,7 @@ Multi-MCP can execute **CLI-based AI models** (like Gemini CLI, Codex CLI, or Cl
 - `gemini-cli` (alias: `gem-cli`) - Gemini CLI with auto-edit mode
 - `codex-cli` (alias: `cx-cli`) - Codex CLI with full-auto mode
 - `claude-cli` (alias: `cl-cli`) - Claude CLI with acceptEdits mode
+- `qwen-cli` (alias: `qw-cli`) - Qwen Code CLI with auto-edit mode (auth/model via `~/.qwen/settings.json`)
 
 **Adding Custom CLI Models:**
 
@@ -301,14 +302,29 @@ CLI models require the respective CLI tools to be installed:
 
 ```bash
 # Gemini CLI
-npm install -g @anthropic-ai/gemini-cli
+npm install -g @google/gemini-cli
 
 # Codex CLI
 npm install -g @openai/codex
 
 # Claude CLI
 npm install -g @anthropic-ai/claude-code
+
+# Qwen Code CLI
+npm install -g @qwen-code/qwen-code@latest
+# or: brew install qwen-code
 ```
+
+**Qwen Code CLI extra setup:**
+
+1. Run `qwen` once and complete the setup (auth type, `modelProviders`, default
+   model). Configuration lives in `~/.qwen/settings.json`.
+2. Put the credential env var your `modelProviders` entry references (e.g.
+   `OLLAMA_API_KEY`, `LM_STUDIO_API_KEY`, `DASHSCOPE_API_KEY`) into one of
+   multi_mcp's env sources — either the project `.env`, `~/.multi_mcp/.env`,
+   or your shell rc. Qwen reads its own `~/.qwen/.env` only when launched from
+   inside `~/.qwen`; from any other working directory it relies on `os.environ`,
+   so multi_mcp forwards these specific keys to the subprocess.
 
 ## CLI Usage (Experimental)
 

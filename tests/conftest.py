@@ -181,6 +181,10 @@ CLI_TOOLS = {
         "install": "pip install anthropic-cli",
         "check": "claude",
     },
+    "qwen": {
+        "install": "npm install -g @qwen-code/qwen-code@latest",
+        "check": "qwen",
+    },
 }
 
 

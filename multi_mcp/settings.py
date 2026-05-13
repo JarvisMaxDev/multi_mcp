@@ -78,6 +78,14 @@ class Settings(BaseSettings):
     gemini_api_key: str | None = Field(default=None, alias="GEMINI_API_KEY")
     openrouter_api_key: str | None = Field(default=None, alias="OPENROUTER_API_KEY")
 
+    # CLI-only credentials: only consumed by CLI subprocesses (e.g. qwen-cli),
+    # never passed to LiteLLM. Qwen Code reads its own ~/.qwen/.env, but only
+    # when run from inside ~/.qwen — when launched from arbitrary cwd it relies
+    # on os.environ, so multi_mcp must forward these keys explicitly.
+    ollama_api_key: str | None = Field(default=None, alias="OLLAMA_API_KEY")
+    lm_studio_api_key: str | None = Field(default=None, alias="LM_STUDIO_API_KEY")
+    dashscope_api_key: str | None = Field(default=None, alias="DASHSCOPE_API_KEY")
+
     # Azure OpenAI (optional - LiteLLM picks these up from os.environ)
     # Note: These are the exact variable names LiteLLM expects
     azure_api_key: str | None = Field(default=None, alias="AZURE_API_KEY")
