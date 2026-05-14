@@ -265,6 +265,12 @@ models:
       - "--approval-mode"
       - "auto-edit"  # Auto-approve edits, ask on shell (note: hyphen, not underscore)
       # - "--yolo"  # Most dangerous: auto-approve ALL tool calls including shell
+      # Each MCP call spawns a fresh qwen subprocess, so we shave the ~1-2s of
+      # auto-memory extract / chat history flush on shutdown. We do NOT add
+      # --bare because it skips modelProviders discovery from ~/.qwen/settings.json,
+      # which would force every user to also configure auth/model/baseUrl here.
+      - "--chat-recording"
+      - "false"
     cli_env: {}  # qwen loads its own ~/.qwen/settings.json (modelProviders) and ~/.qwen/.env
     cli_parser: qwen-json  # Dedicated parser: qwen emits an array of events ending in type:"result"
     aliases:
