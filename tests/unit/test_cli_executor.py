@@ -325,6 +325,104 @@ class TestCLIExecutor:
             assert result.status == "success"
 
     @pytest.mark.asyncio
+    async def test_execute_qwen_keys_only_forwarded_to_qwen(self, cli_executor):
+        """Qwen-only credentials (OLLAMA/LM_STUDIO/DASHSCOPE) MUST NOT leak into non-qwen CLI envs.
+
+        Principle of least privilege: claude/gemini/codex/custom subprocess environments
+        shouldn't see Ollama/LM Studio/DashScope keys they have no use for.
+        """
+        non_qwen_config = ModelConfig(
+            provider="cli",
+            cli_command="claude",
+            cli_args=[],
+            cli_parser="json",
+            cli_env={},
+        )
+
+        mock_process = MagicMock()
+        mock_process.returncode = 0
+        mock_process.communicate = AsyncMock(return_value=(b'{"result":"ok","is_error":false}', b""))
+
+        with (
+            patch("shutil.which", return_value="/usr/bin/claude"),
+            patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
+            patch("multi_mcp.models.cli_executor.settings") as mock_settings,
+            patch("multi_mcp.models.cli_executor.log_llm_interaction"),
+        ):
+            mock_settings.anthropic_api_key = "claude-key"
+            mock_settings.openai_api_key = None
+            mock_settings.gemini_api_key = None
+            mock_settings.openrouter_api_key = None
+            mock_settings.ollama_api_key = "secret-ollama"
+            mock_settings.lm_studio_api_key = "secret-lm-studio"
+            mock_settings.dashscope_api_key = "secret-dashscope"
+            mock_settings.model_timeout_seconds = 120
+
+            # Ensure os.environ doesn't already have these keys (would leak independently)
+            with patch.dict("os.environ", {}, clear=False):
+                os_env = {"PATH": "/usr/bin"}
+                for k in ("OLLAMA_API_KEY", "LM_STUDIO_API_KEY", "DASHSCOPE_API_KEY"):
+                    os_env.pop(k, None)
+                with patch("os.environ", os_env, create=False):
+                    pass
+                mock_exec.return_value = mock_process
+                await cli_executor.execute(
+                    canonical_name="claude-cli",
+                    model_config=non_qwen_config,
+                    messages=[{"role": "user", "content": "test"}],
+                )
+
+            call_env = mock_exec.call_args[1]["env"]
+            # Anthropic key SHOULD be present (claude-cli's normal credential)
+            assert call_env.get("ANTHROPIC_API_KEY") == "claude-key"
+            # Qwen-only keys MUST NOT be in claude-cli's env (gated to cli_command=="qwen")
+            assert "OLLAMA_API_KEY" not in call_env or call_env["OLLAMA_API_KEY"] != "secret-ollama"
+            assert "LM_STUDIO_API_KEY" not in call_env or call_env["LM_STUDIO_API_KEY"] != "secret-lm-studio"
+            assert "DASHSCOPE_API_KEY" not in call_env or call_env["DASHSCOPE_API_KEY"] != "secret-dashscope"
+
+    @pytest.mark.asyncio
+    async def test_execute_qwen_keys_forwarded_to_qwen(self, cli_executor):
+        """Qwen-only credentials MUST be forwarded when cli_command == 'qwen' (positive case)."""
+        qwen_config = ModelConfig(
+            provider="cli",
+            cli_command="qwen",
+            cli_args=[],
+            cli_parser="qwen-json",
+            cli_env={},
+        )
+
+        mock_process = MagicMock()
+        mock_process.returncode = 0
+        mock_process.communicate = AsyncMock(return_value=(b'[{"type":"result","is_error":false,"result":"ok"}]', b""))
+
+        with (
+            patch("shutil.which", return_value="/usr/bin/qwen"),
+            patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
+            patch("multi_mcp.models.cli_executor.settings") as mock_settings,
+            patch("multi_mcp.models.cli_executor.log_llm_interaction"),
+        ):
+            mock_settings.anthropic_api_key = None
+            mock_settings.openai_api_key = None
+            mock_settings.gemini_api_key = None
+            mock_settings.openrouter_api_key = None
+            mock_settings.ollama_api_key = "ollama-key"
+            mock_settings.lm_studio_api_key = "lm-key"
+            mock_settings.dashscope_api_key = "ds-key"
+            mock_settings.model_timeout_seconds = 120
+
+            mock_exec.return_value = mock_process
+            await cli_executor.execute(
+                canonical_name="qwen-cli",
+                model_config=qwen_config,
+                messages=[{"role": "user", "content": "test"}],
+            )
+
+            call_env = mock_exec.call_args[1]["env"]
+            assert call_env["OLLAMA_API_KEY"] == "ollama-key"
+            assert call_env["LM_STUDIO_API_KEY"] == "lm-key"
+            assert call_env["DASHSCOPE_API_KEY"] == "ds-key"
+
+    @pytest.mark.asyncio
     async def test_execute_serializes_full_message_history(self, cli_executor, cli_model_config):
         """All messages (system + history + new user turn) should reach the CLI as a labeled transcript.
 
@@ -479,26 +577,26 @@ class TestCLIExecutor:
             '{"type":"assistant","message":{"content":[{"type":"text","text":"thinking..."}]}},'
             '{"type":"result","subtype":"success","is_error":false,"result":"Qwen final answer"}]'
         )
-        result = cli_executor._parse_output(stdout, "json")
+        result = cli_executor._parse_output(stdout, "qwen-json")
         assert result == "Qwen final answer"
 
     def test_parse_output_json_qwen_error_in_result_field(self, cli_executor):
         """Qwen `is_error: true` with message in `result` → ValueError using that message."""
         stdout = '[{"type":"result","is_error":true,"result":"auth failed: invalid api key"}]'
         with pytest.raises(ValueError, match="Qwen CLI error: auth failed"):
-            cli_executor._parse_output(stdout, "json")
+            cli_executor._parse_output(stdout, "qwen-json")
 
     def test_parse_output_json_qwen_error_in_error_field(self, cli_executor):
         """Qwen `is_error: true` without `result` but with `error` → ValueError uses `error`."""
         stdout = '[{"type":"result","is_error":true,"error":"tool exec failed","subtype":"tool_error"}]'
         with pytest.raises(ValueError, match="Qwen CLI error: tool exec failed"):
-            cli_executor._parse_output(stdout, "json")
+            cli_executor._parse_output(stdout, "qwen-json")
 
     def test_parse_output_json_qwen_error_no_message(self, cli_executor):
         """Qwen `is_error: true` with no string fields → ValueError with 'unknown failure'."""
         stdout = '[{"type":"result","is_error":true}]'
         with pytest.raises(ValueError, match="Qwen CLI error: unknown failure"):
-            cli_executor._parse_output(stdout, "json")
+            cli_executor._parse_output(stdout, "qwen-json")
 
     def test_parse_output_json_qwen_assistant_fallback(self, cli_executor):
         """Empty/missing `result` field → fall back to last assistant `content[].text`."""
@@ -510,7 +608,7 @@ class TestCLIExecutor:
             "]}},"
             '{"type":"result","subtype":"success","is_error":false,"result":""}]'
         )
-        result = cli_executor._parse_output(stdout, "json")
+        result = cli_executor._parse_output(stdout, "qwen-json")
         assert result == "first chunk\nsecond chunk"
 
     def test_parse_output_json_qwen_assistant_fallback_no_result_event(self, cli_executor):
@@ -519,7 +617,7 @@ class TestCLIExecutor:
             '[{"type":"system","subtype":"session_start"},'
             '{"type":"assistant","message":{"content":[{"type":"text","text":"only assistant"}]}}]'
         )
-        result = cli_executor._parse_output(stdout, "json")
+        result = cli_executor._parse_output(stdout, "qwen-json")
         assert result == "only assistant"
 
     def test_parse_output_json_qwen_picks_last_result(self, cli_executor):
@@ -529,13 +627,13 @@ class TestCLIExecutor:
             '{"type":"assistant","message":{"content":[{"type":"text","text":"more"}]}},'
             '{"type":"result","is_error":false,"result":"final"}]'
         )
-        result = cli_executor._parse_output(stdout, "json")
+        result = cli_executor._parse_output(stdout, "qwen-json")
         assert result == "final"
 
     def test_parse_output_json_qwen_nested_result(self, cli_executor):
         """Qwen `result` as object/list (defensive) → re-serialize as JSON string."""
         stdout = '[{"type":"result","is_error":false,"result":{"answer":42,"ok":true}}]'
-        result = cli_executor._parse_output(stdout, "json")
+        result = cli_executor._parse_output(stdout, "qwen-json")
         assert isinstance(result, str)
         import json as _json
 
@@ -545,13 +643,67 @@ class TestCLIExecutor:
     def test_parse_output_json_qwen_no_usable_content(self, cli_executor):
         """No result event and no assistant text → re-serialize whole array for debug."""
         stdout = '[{"type":"system","subtype":"session_start"},{"type":"tool_call","name":"foo"}]'
-        result = cli_executor._parse_output(stdout, "json")
+        result = cli_executor._parse_output(stdout, "qwen-json")
         assert isinstance(result, str)
         import json as _json
 
         reparsed = _json.loads(result)
         assert isinstance(reparsed, list)
         assert reparsed[0]["type"] == "system"
+
+    def test_parse_output_json_array_not_treated_as_qwen(self, cli_executor):
+        """REGRESSION: `cli_parser: json` (generic) with a JSON array must NOT trigger qwen
+        event parsing. Custom user CLIs declaring `cli_parser: json` and returning JSON
+        arrays should get the array re-serialized as a JSON string (preserved data), not
+        collapsed to the last 'result' field.
+        """
+        stdout = '[{"type":"result","result":"would be wrong to collapse this"}]'
+        result = cli_executor._parse_output(stdout, "json")
+        # Must be re-parseable JSON of the original array — NOT the inner 'result' string
+        import json as _json
+
+        reparsed = _json.loads(result)
+        assert isinstance(reparsed, list)
+        assert reparsed[0]["type"] == "result"
+        # Specifically: NOT the qwen-extracted value
+        assert result != "would be wrong to collapse this"
+
+    def test_parse_output_qwen_json_missing_result_key_uses_assistant_fallback(self, cli_executor):
+        """`is_error: false` with no `result` key at all (not just empty string) → assistant fallback."""
+        stdout = (
+            '[{"type":"assistant","message":{"content":[{"type":"text","text":"fallback text"}]}},'
+            '{"type":"result","subtype":"success","is_error":false}]'
+        )
+        result = cli_executor._parse_output(stdout, "qwen-json")
+        assert result == "fallback text"
+
+    def test_parse_output_qwen_json_non_list_input(self, cli_executor):
+        """Defensive: qwen-json parser given a single object (contract violation) re-serializes."""
+        stdout = '{"type":"result","result":"single object"}'
+        result = cli_executor._parse_output(stdout, "qwen-json")
+        # Falls through to JSON re-serialization, not the dict-format handling
+        import json as _json
+
+        reparsed = _json.loads(result)
+        assert reparsed == {"type": "result", "result": "single object"}
+
+    def test_parse_output_qwen_json_malformed(self, cli_executor):
+        """qwen-json parser falls back to text on malformed JSON."""
+        stdout = "not valid json"
+        result = cli_executor._parse_output(stdout, "qwen-json")
+        assert result == "not valid json"
+
+    def test_parse_output_qwen_json_text_part_non_string_ignored(self, cli_executor):
+        """Defensive: assistant content[].text must be a string; non-string entries are skipped."""
+        stdout = (
+            '[{"type":"assistant","message":{"content":['
+            '{"type":"text","text":{"nested":"object"}},'
+            '{"type":"text","text":"valid string"}'
+            "]}},"
+            '{"type":"result","is_error":false,"result":""}]'
+        )
+        result = cli_executor._parse_output(stdout, "qwen-json")
+        assert result == "valid string"
 
     def test_get_install_hint_qwen(self, cli_executor):
         """Install hint for Qwen Code CLI must reference its npm package."""
@@ -566,7 +718,7 @@ class TestCLIExecutor:
             provider="cli",
             cli_command="qwen",
             cli_args=["--output-format", "json", "--approval-mode", "auto-edit"],
-            cli_parser="json",
+            cli_parser="qwen-json",
             cli_env={},
         )
         qwen_output = (
@@ -606,7 +758,7 @@ class TestCLIExecutor:
             provider="cli",
             cli_command="qwen",
             cli_args=[],
-            cli_parser="json",
+            cli_parser="qwen-json",
             cli_env={},
         )
         mock_process = MagicMock()

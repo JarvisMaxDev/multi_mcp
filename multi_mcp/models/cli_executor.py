@@ -69,15 +69,18 @@ class CLIExecutor:
             env["GEMINI_API_KEY"] = settings.gemini_api_key
         if settings.openrouter_api_key:
             env["OPENROUTER_API_KEY"] = settings.openrouter_api_key
-        # CLI-only keys: forwarded to subprocess env so qwen-cli (which talks
-        # to Ollama / LM Studio / DashScope via its OpenAI-compatible mode)
-        # finds the credential its modelProviders entry references.
-        if settings.ollama_api_key:
-            env["OLLAMA_API_KEY"] = settings.ollama_api_key
-        if settings.lm_studio_api_key:
-            env["LM_STUDIO_API_KEY"] = settings.lm_studio_api_key
-        if settings.dashscope_api_key:
-            env["DASHSCOPE_API_KEY"] = settings.dashscope_api_key
+        # CLI-only keys: forwarded ONLY to qwen-cli (the sole consumer), to
+        # keep these credentials out of unrelated CLI subprocess environments.
+        # Qwen talks to Ollama / LM Studio / DashScope via its OpenAI-compatible
+        # mode and reads these keys from os.environ. Other CLIs (claude, codex,
+        # gemini) must not receive them — principle of least privilege.
+        if cli_command == "qwen":
+            if settings.ollama_api_key:
+                env["OLLAMA_API_KEY"] = settings.ollama_api_key
+            if settings.lm_studio_api_key:
+                env["LM_STUDIO_API_KEY"] = settings.lm_studio_api_key
+            if settings.dashscope_api_key:
+                env["DASHSCOPE_API_KEY"] = settings.dashscope_api_key
 
         # Now expand variables in cli_env (e.g., ${ANTHROPIC_API_KEY}).
         # Build a stable lookup map that contains all cli_env keys upfront so
@@ -301,16 +304,30 @@ class CLIExecutor:
         Returns:
             Parsed content string
         """
+        if parser_type == "qwen-json":
+            # Qwen Code CLI emits an array of message events ending in a
+            # `type:"result"` event. Scoped to its own parser_type so generic
+            # `cli_parser: json` (used by gemini, claude, and any custom user
+            # CLI returning JSON arrays) keeps its original re-serialize
+            # behavior unchanged.
+            parsed = parse_llm_json(stdout)
+            if parsed is not None and isinstance(parsed, list):
+                return self._parse_qwen_event_array(parsed)
+            if parsed is not None:
+                # Defensive: qwen-json should always be a list. If not, fall
+                # through to JSON serialization rather than crashing.
+                logger.warning(
+                    "[CLI_PARSE] qwen-json parser got non-list (%s); re-serializing",
+                    type(parsed).__name__,
+                )
+                return json.dumps(parsed, ensure_ascii=False)
+            logger.warning("[CLI_PARSE] qwen-json parse failed, falling back to text")
+            return stdout.strip()
+
         if parser_type == "json":
             # Use existing robust JSON parser (handles malformed JSON)
             parsed = parse_llm_json(stdout)
             if parsed is not None:
-                # Qwen CLI emits an array of message events; the final answer
-                # lives in the last element with type=="result". Handle this
-                # before the dict branch so gemini/claude (dict-shaped output)
-                # remain unaffected.
-                if isinstance(parsed, list):
-                    return self._parse_qwen_event_array(parsed)
                 # Extract content based on CLI format
                 if isinstance(parsed, dict):
                     # Claude CLI format: check for errors first
@@ -421,7 +438,11 @@ class CLIExecutor:
                 continue
             content = message.get("content")
             if isinstance(content, list):
-                text_parts = [part.get("text", "") for part in content if isinstance(part, dict) and part.get("type") == "text"]
+                text_parts = [
+                    part["text"]
+                    for part in content
+                    if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str)
+                ]
                 joined = "\n".join(t for t in text_parts if t)
                 if joined:
                     return joined
