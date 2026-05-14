@@ -52,12 +52,23 @@ class CLIExecutor:
 
         # Narrow type for type checker - we know cli_command is str here
         cli_command: str = model_config.cli_command
+        # Match by basename so absolute paths (`/opt/homebrew/bin/qwen`) and
+        # wrapper scripts still resolve to "qwen" for credential gating below.
+        cli_executable = os.path.basename(cli_command)
 
         # Build the subprocess environment FIRST so the cli_env PATH override
         # (if any) is honored by the shutil.which preflight below. Otherwise a
         # CLI that's only reachable via a custom PATH set in cli_env would be
         # rejected before we even try to launch it.
         env = os.environ.copy()
+        # Defense-in-depth: strip qwen-only credentials INHERITED from parent
+        # env for non-qwen CLIs. The Settings-injection block below already
+        # gates these keys on cli_executable == "qwen", but `os.environ.copy()`
+        # above would otherwise leak them into claude/codex/gemini subprocesses
+        # if the user has them set via shell rc or ~/.multi_mcp/.env.
+        if cli_executable != "qwen":
+            for qwen_only_key in ("OLLAMA_API_KEY", "LM_STUDIO_API_KEY", "DASHSCOPE_API_KEY"):
+                env.pop(qwen_only_key, None)
 
         # Inject API keys from settings into environment for expansion
         # This allows ${ANTHROPIC_API_KEY} etc. to work even if not in os.environ
@@ -74,7 +85,7 @@ class CLIExecutor:
         # Qwen talks to Ollama / LM Studio / DashScope via its OpenAI-compatible
         # mode and reads these keys from os.environ. Other CLIs (claude, codex,
         # gemini) must not receive them — principle of least privilege.
-        if cli_command == "qwen":
+        if cli_executable == "qwen":
             if settings.ollama_api_key:
                 env["OLLAMA_API_KEY"] = settings.ollama_api_key
             if settings.lm_studio_api_key:

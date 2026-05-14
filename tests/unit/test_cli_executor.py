@@ -348,37 +348,49 @@ class TestCLIExecutor:
             patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
             patch("multi_mcp.models.cli_executor.settings") as mock_settings,
             patch("multi_mcp.models.cli_executor.log_llm_interaction"),
+            # Critical: simulate the realistic threat — qwen-only keys ALREADY
+            # in os.environ (loaded by Settings from .env files). Without the
+            # inherited-env strip in cli_executor these would leak to claude.
+            # `clear=True` removes everything else so we test in isolation.
+            patch.dict(
+                "os.environ",
+                {
+                    "PATH": "/usr/bin",
+                    "OLLAMA_API_KEY": "inherited-ollama-secret",
+                    "LM_STUDIO_API_KEY": "inherited-lm-secret",
+                    "DASHSCOPE_API_KEY": "inherited-ds-secret",
+                },
+                clear=True,
+            ),
         ):
             mock_settings.anthropic_api_key = "claude-key"
             mock_settings.openai_api_key = None
             mock_settings.gemini_api_key = None
             mock_settings.openrouter_api_key = None
-            mock_settings.ollama_api_key = "secret-ollama"
-            mock_settings.lm_studio_api_key = "secret-lm-studio"
-            mock_settings.dashscope_api_key = "secret-dashscope"
+            mock_settings.ollama_api_key = "settings-ollama"
+            mock_settings.lm_studio_api_key = "settings-lm-studio"
+            mock_settings.dashscope_api_key = "settings-dashscope"
             mock_settings.model_timeout_seconds = 120
 
-            # Ensure os.environ doesn't already have these keys (would leak independently)
-            with patch.dict("os.environ", {}, clear=False):
-                os_env = {"PATH": "/usr/bin"}
-                for k in ("OLLAMA_API_KEY", "LM_STUDIO_API_KEY", "DASHSCOPE_API_KEY"):
-                    os_env.pop(k, None)
-                with patch("os.environ", os_env, create=False):
-                    pass
-                mock_exec.return_value = mock_process
-                await cli_executor.execute(
-                    canonical_name="claude-cli",
-                    model_config=non_qwen_config,
-                    messages=[{"role": "user", "content": "test"}],
-                )
+            mock_exec.return_value = mock_process
+            await cli_executor.execute(
+                canonical_name="claude-cli",
+                model_config=non_qwen_config,
+                messages=[{"role": "user", "content": "test"}],
+            )
 
             call_env = mock_exec.call_args[1]["env"]
             # Anthropic key SHOULD be present (claude-cli's normal credential)
             assert call_env.get("ANTHROPIC_API_KEY") == "claude-key"
-            # Qwen-only keys MUST NOT be in claude-cli's env (gated to cli_command=="qwen")
-            assert "OLLAMA_API_KEY" not in call_env or call_env["OLLAMA_API_KEY"] != "secret-ollama"
-            assert "LM_STUDIO_API_KEY" not in call_env or call_env["LM_STUDIO_API_KEY"] != "secret-lm-studio"
-            assert "DASHSCOPE_API_KEY" not in call_env or call_env["DASHSCOPE_API_KEY"] != "secret-dashscope"
+            # Qwen-only keys MUST be ABSENT — neither inherited from parent env
+            # nor injected by Settings should reach a non-qwen subprocess.
+            assert "OLLAMA_API_KEY" not in call_env, f"OLLAMA_API_KEY leaked into claude-cli env: {call_env.get('OLLAMA_API_KEY')!r}"
+            assert "LM_STUDIO_API_KEY" not in call_env, (
+                f"LM_STUDIO_API_KEY leaked into claude-cli env: {call_env.get('LM_STUDIO_API_KEY')!r}"
+            )
+            assert "DASHSCOPE_API_KEY" not in call_env, (
+                f"DASHSCOPE_API_KEY leaked into claude-cli env: {call_env.get('DASHSCOPE_API_KEY')!r}"
+            )
 
     @pytest.mark.asyncio
     async def test_execute_qwen_keys_forwarded_to_qwen(self, cli_executor):
@@ -400,6 +412,8 @@ class TestCLIExecutor:
             patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
             patch("multi_mcp.models.cli_executor.settings") as mock_settings,
             patch("multi_mcp.models.cli_executor.log_llm_interaction"),
+            # Isolate from real os.environ so we measure ONLY the Settings injection
+            patch.dict("os.environ", {"PATH": "/usr/bin"}, clear=True),
         ):
             mock_settings.anthropic_api_key = None
             mock_settings.openai_api_key = None
@@ -421,6 +435,53 @@ class TestCLIExecutor:
             assert call_env["OLLAMA_API_KEY"] == "ollama-key"
             assert call_env["LM_STUDIO_API_KEY"] == "lm-key"
             assert call_env["DASHSCOPE_API_KEY"] == "ds-key"
+
+    @pytest.mark.asyncio
+    async def test_execute_qwen_basename_matching_for_absolute_paths(self, cli_executor):
+        """Credential gating must work when cli_command is an absolute path or wrapper.
+
+        Users may legitimately set `cli_command: /opt/homebrew/bin/qwen` or use a
+        wrapper script. Exact-match `cli_command == "qwen"` would silently drop
+        credentials for those configurations.
+        """
+        qwen_abspath_config = ModelConfig(
+            provider="cli",
+            cli_command="/opt/homebrew/bin/qwen",  # absolute path
+            cli_args=[],
+            cli_parser="qwen-json",
+            cli_env={},
+        )
+
+        mock_process = MagicMock()
+        mock_process.returncode = 0
+        mock_process.communicate = AsyncMock(return_value=(b'[{"type":"result","is_error":false,"result":"ok"}]', b""))
+
+        with (
+            patch("shutil.which", return_value="/opt/homebrew/bin/qwen"),
+            patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
+            patch("multi_mcp.models.cli_executor.settings") as mock_settings,
+            patch("multi_mcp.models.cli_executor.log_llm_interaction"),
+            patch.dict("os.environ", {"PATH": "/usr/bin"}, clear=True),
+        ):
+            mock_settings.anthropic_api_key = None
+            mock_settings.openai_api_key = None
+            mock_settings.gemini_api_key = None
+            mock_settings.openrouter_api_key = None
+            mock_settings.ollama_api_key = "ollama-key"
+            mock_settings.lm_studio_api_key = None
+            mock_settings.dashscope_api_key = None
+            mock_settings.model_timeout_seconds = 120
+
+            mock_exec.return_value = mock_process
+            await cli_executor.execute(
+                canonical_name="qwen-cli",
+                model_config=qwen_abspath_config,
+                messages=[{"role": "user", "content": "test"}],
+            )
+
+            call_env = mock_exec.call_args[1]["env"]
+            # Even with absolute path, basename "qwen" should match and inject
+            assert call_env["OLLAMA_API_KEY"] == "ollama-key"
 
     @pytest.mark.asyncio
     async def test_execute_serializes_full_message_history(self, cli_executor, cli_model_config):
