@@ -59,6 +59,46 @@ def _extract_content_from_responses_api(response) -> str:
     return ""
 
 
+def _extract_content_from_chat_completion(response) -> str:
+    """Extract text from Chat Completions API response (used by Ollama and other non-Responses providers).
+
+    Standard OpenAI chat-completion shape: response.choices[0].message.content
+    Handles both object and dict formats (LiteLLM normalizes provider responses).
+    Normalizes structured content (list of parts) to a string to satisfy the
+    ModelResponse(content: str) contract; unexpected shapes log a debug message
+    and return "".
+    """
+    choices = response.get("choices") if isinstance(response, dict) else getattr(response, "choices", None)
+    if not choices:
+        logger.warning("[RESPONSE_PARSE] Chat completion response has no choices")
+        return ""
+
+    first = choices[0]
+    message = first.get("message") if isinstance(first, dict) else getattr(first, "message", None)
+    if message is None:
+        logger.warning("[RESPONSE_PARSE] Chat completion first choice has no message")
+        return ""
+
+    content = message.get("content") if isinstance(message, dict) else getattr(message, "content", None)
+
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    # Some providers return structured content as a list of parts (e.g. [{"type": "text", "text": "..."}])
+    if isinstance(content, list):
+        return "".join(c.get("text", "") if isinstance(c, dict) else getattr(c, "text", "") for c in content if c)
+    logger.debug(f"[RESPONSE_PARSE] Unexpected chat completion content type '{type(content).__name__}'")
+    return ""
+
+
+# Provider prefixes that must use Chat Completions API (litellm.acompletion).
+# LiteLLM's Responses API (litellm.aresponses) only routes for providers that natively
+# support it: OpenAI, Azure OpenAI, Anthropic, Gemini. Ollama (and others) only
+# expose chat-completions, so calling aresponses() raises BadRequestError.
+_CHAT_COMPLETION_PROVIDERS: frozenset[str] = frozenset({"ollama", "ollama_chat"})
+
+
 class LiteLLMClient:
     """Wrapper for LiteLLM model calls with config-based resolution."""
 
@@ -182,51 +222,90 @@ class LiteLLMClient:
             if model_config.constraints and model_config.constraints.temperature is not None:
                 temp = model_config.constraints.temperature
 
-            logger.info(f"[MODEL_CALL] canonical={canonical_name} litellm={litellm_model} temp={temp}")
+            # Detect provider to choose API path.
+            # Ollama (and similar providers) only support Chat Completions, not Responses API.
+            provider_prefix = litellm_model.split("/", 1)[0].lower() if "/" in litellm_model else ""
+            use_chat_completion = provider_prefix in _CHAT_COMPLETION_PROVIDERS
+            api_path = "acompletion" if use_chat_completion else "aresponses"
 
-            # Build kwargs starting with generic params from config
+            logger.info(f"[MODEL_CALL] canonical={canonical_name} litellm={litellm_model} temp={temp} api={api_path}")
+
+            # Build kwargs starting with generic params from config.
+            # Key difference: Chat Completions uses "messages", Responses API uses "input".
             kwargs: dict[str, Any] = {
                 **model_config.params,
                 "model": litellm_model,
-                "input": messages,
                 "temperature": temp,
                 "num_retries": settings.max_retries,
                 "timeout": timeout,
             }
+            if use_chat_completion:
+                kwargs["messages"] = messages
+                # Explicit api_base if user configured it. LiteLLM also reads OLLAMA_API_BASE
+                # from env (set in settings.set_provider_env_vars), but explicit beats implicit.
+                if provider_prefix in {"ollama", "ollama_chat"} and settings.ollama_api_base:
+                    kwargs["api_base"] = settings.ollama_api_base
+            else:
+                kwargs["input"] = messages
 
             # Set max_tokens: config value > sensible default
+            # LiteLLM translates this to provider-specific param (num_predict for Ollama).
             max_tokens = model_config.max_tokens if model_config.max_tokens is not None else DEFAULT_MAX_TOKENS
             kwargs["max_tokens"] = max_tokens
             logger.debug(f"[MODEL_CALL] Using max_tokens={max_tokens} ({'config' if model_config.max_tokens else 'default'})")
 
-            # Enable provider-native web search if requested and supported
-            if enable_web_search and model_config.has_provider_web_search():
+            # Enable provider-native web search if requested and supported.
+            # Only Responses API providers (OpenAI, Gemini) support the unified web_search tool;
+            # Ollama and other chat-completion providers don't have this concept.
+            if not use_chat_completion and enable_web_search and model_config.has_provider_web_search():
                 kwargs["tools"] = [{"type": "web_search"}]
                 logger.info(f"[WEB_SEARCH] Enabled for model: {canonical_name}")
 
-            logger.debug(f"[MODEL_REQUEST] litellm_model={litellm_model} num_messages={len(messages)}")
+            logger.debug(f"[MODEL_REQUEST] litellm_model={litellm_model} num_messages={len(messages)} api={api_path}")
 
-            # Call LiteLLM with timeout protection
+            # Call LiteLLM via the appropriate API for the provider.
+            # `raw_response` is the LiteLLM ModelResponse object; we keep it distinct from
+            # our own `model_response` constructed below to avoid the shadowing trap where
+            # log_llm_interaction would log the wrong shape if reordered.
             start_time = time.perf_counter()
-            response = await asyncio.wait_for(
-                litellm.aresponses(**kwargs),
-                timeout=timeout,
-            )
+            if use_chat_completion:
+                raw_response = await asyncio.wait_for(litellm.acompletion(**kwargs), timeout=timeout)
+                content = _extract_content_from_chat_completion(raw_response)
+            else:
+                raw_response = await asyncio.wait_for(litellm.aresponses(**kwargs), timeout=timeout)
+                content = _extract_content_from_responses_api(raw_response)
             latency_ms = int((time.perf_counter() - start_time) * 1000)
 
-            content = _extract_content_from_responses_api(response)
+            # Treat empty content as an error rather than a silent success.
+            # Both extractors return "" defensively for malformed responses (missing output/choices,
+            # message item not found, etc.); without this guard, callers would receive
+            # status="success" with no content and silently produce bad reviews/empty answers.
+            if not content.strip():
+                error_msg = f"Model '{canonical_name}' returned empty content via {api_path}"
+                logger.error(f"[MODEL_CALL] {error_msg}")
+                return ModelResponse.error_response(error=error_msg, model=canonical_name)
 
-            # Extract usage stats (responses API only provides total_tokens)
+            # Extract usage stats. Both APIs expose response.usage.total_tokens
+            # (chat completions also has prompt/completion split, but we only need the total).
+            # LiteLLM can return response as either an object or a raw dict depending on provider,
+            # so handle both shapes. Also fall back to prompt+completion sum when total isn't set,
+            # which some chat-completion providers do.
             total_tokens = 0
-            if hasattr(response, "usage") and response.usage:  # type: ignore[attr-defined]
-                total_tokens = getattr(response.usage, "total_tokens", 0)  # type: ignore[attr-defined]
+            usage = raw_response.get("usage") if isinstance(raw_response, dict) else getattr(raw_response, "usage", None)
+            if usage:
+                if isinstance(usage, dict):
+                    total_tokens = usage.get("total_tokens") or ((usage.get("prompt_tokens") or 0) + (usage.get("completion_tokens") or 0))
+                else:
+                    total_tokens = getattr(usage, "total_tokens", None) or (
+                        (getattr(usage, "prompt_tokens", 0) or 0) + (getattr(usage, "completion_tokens", 0) or 0)
+                    )
 
             metadata = ModelResponseMetadata(
                 model=canonical_name,
                 total_tokens=total_tokens,
                 latency_ms=latency_ms,
             )
-            response = ModelResponse(
+            model_response = ModelResponse(
                 content=content,
                 status="success",
                 metadata=metadata,
@@ -234,18 +313,22 @@ class LiteLLMClient:
 
             log_llm_interaction(
                 request_data={**kwargs},
-                response_data=response.model_dump(),
+                response_data=model_response.model_dump(),
             )
-            return response
+            return model_response
 
-        except TimeoutError:
+        except (TimeoutError, litellm.Timeout):
+            # litellm.Timeout fires from LiteLLM's internal HTTP layer; TimeoutError fires
+            # from our asyncio.wait_for wrapper. Either way, surface a consistent timeout message.
             logger.error(f"[MODEL_CALL] Model {canonical_name} timed out after {timeout}s")
             return ModelResponse.error_response(
                 error=f"Request timed out after {timeout}s",
                 model=canonical_name,
             )
         except Exception as e:
-            logger.error(f"[MODEL_CALL] Model {canonical_name} failed: {e}")
+            # logger.exception captures the full traceback — critical for diagnosing
+            # non-trivial LiteLLM failures (auth errors, malformed responses, network glitches).
+            logger.exception(f"[MODEL_CALL] Model {canonical_name} failed: {e}")
             return ModelResponse.error_response(
                 error=str(e),
                 model=canonical_name,

@@ -32,9 +32,6 @@ class ProviderConfig:
         Raises:
             ValueError: If credentials are invalid
         """
-        if not self.credentials:
-            raise ValueError(f"ProviderConfig '{self.name}' must have at least one credential")
-
         for i, cred in enumerate(self.credentials):
             if not isinstance(cred, tuple) or len(cred) != 2:
                 raise ValueError(f"ProviderConfig '{self.name}' credential {i} must be a 2-tuple, got {type(cred).__name__}")
@@ -80,6 +77,14 @@ PROVIDERS: Final[dict[str, ProviderConfig]] = {
     "openai": ProviderConfig(
         name="OpenAI",
         credentials=(("openai_api_key", "OPENAI_API_KEY"),),
+    ),
+    "ollama": ProviderConfig(
+        name="Ollama",
+        credentials=(),
+    ),
+    "ollama_chat": ProviderConfig(
+        name="Ollama",
+        credentials=(),
     ),
 }
 

@@ -86,6 +86,9 @@ class Settings(BaseSettings):
     lm_studio_api_key: str | None = Field(default=None, alias="LM_STUDIO_API_KEY")
     dashscope_api_key: str | None = Field(default=None, alias="DASHSCOPE_API_KEY")
 
+    # Ollama (local LLM server — no API key required, just a running server)
+    ollama_api_base: str | None = Field(default=None, alias="OLLAMA_API_BASE")
+
     # Azure OpenAI (optional - LiteLLM picks these up from os.environ)
     # Note: These are the exact variable names LiteLLM expects
     azure_api_key: str | None = Field(default=None, alias="AZURE_API_KEY")
@@ -198,6 +201,10 @@ class Settings(BaseSettings):
         # Set Azure API version (config parameter, not a credential)
         if self.azure_api_version and not os.getenv("AZURE_API_VERSION"):
             os.environ["AZURE_API_VERSION"] = self.azure_api_version
+
+        # Set Ollama API base URL (local server endpoint)
+        if self.ollama_api_base and not os.getenv("OLLAMA_API_BASE"):
+            os.environ["OLLAMA_API_BASE"] = self.ollama_api_base
 
         return self
 

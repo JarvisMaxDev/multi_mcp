@@ -10,6 +10,7 @@ import yaml
 from multi_mcp.models.config import (
     ModelConfig,
     ModelsConfiguration,
+    ProviderConfig,
     get_models_config,
     load_models_config,
 )
@@ -55,6 +56,37 @@ class TestModelConfig:
         provider = config.get_provider()
 
         assert provider == "unknown"
+
+    def test_model_config_get_provider_from_prefix_ollama_chat(self):
+        """Test provider extraction for ollama_chat prefix."""
+        config = ModelConfig(litellm_model="ollama_chat/llama3.2")
+        assert config.get_provider() == "ollama_chat"
+
+    def test_model_config_get_provider_from_prefix_ollama(self):
+        """Test provider extraction for ollama prefix."""
+        config = ModelConfig(litellm_model="ollama/llama3.2")
+        assert config.get_provider() == "ollama"
+
+
+class TestProviderConfig:
+    """Tests for ProviderConfig dataclass."""
+
+    def test_provider_config_empty_credentials_allowed(self):
+        """Test that ProviderConfig accepts empty credentials (e.g., Ollama)."""
+        config = ProviderConfig(name="Ollama", credentials=())
+        assert config.name == "Ollama"
+        assert config.credentials == ()
+
+    def test_provider_config_with_credentials(self):
+        """Test that ProviderConfig works with standard credentials."""
+        config = ProviderConfig(name="OpenAI", credentials=(("openai_api_key", "OPENAI_API_KEY"),))
+        assert config.name == "OpenAI"
+        assert len(config.credentials) == 1
+
+    def test_provider_config_invalid_credential_tuple(self):
+        """Test that ProviderConfig rejects malformed credential tuples."""
+        with pytest.raises(ValueError, match="must be a 2-tuple"):
+            ProviderConfig(name="Bad", credentials=(("only_one",),))
 
 
 class TestModelsConfiguration:
