@@ -267,11 +267,16 @@ class TestLiteLLMClient:
 
             call_kwargs = mock_completion.call_args[1]
             assert call_kwargs["top_p"] == 0.9
-            assert call_kwargs["max_tokens"] == 2000
+            # Responses API uses `max_output_tokens`, not `max_tokens` (LiteLLM Responses API contract)
+            assert call_kwargs["max_output_tokens"] == 2000
+            assert "max_tokens" not in call_kwargs
 
     @pytest.mark.asyncio
     async def test_call_async_uses_default_max_tokens(self, sample_config, mock_llm_response):
-        """Test that default max_tokens (32768) is used when not configured."""
+        """Test that default max_tokens (32768) is used when not configured.
+
+        For Responses API path, the parameter is named `max_output_tokens` (not `max_tokens`).
+        """
         # Use sample_config which doesn't have max_tokens set
         resolver = ModelResolver(config=sample_config)
         client = LiteLLMClient(resolver=resolver)
@@ -287,7 +292,8 @@ class TestLiteLLMClient:
             await client.execute(canonical_name=canonical_name, model_config=model_config, messages=[{"role": "user", "content": "Hello"}])
 
             call_kwargs = mock_completion.call_args[1]
-            assert call_kwargs["max_tokens"] == 32768  # Default value
+            assert call_kwargs["max_output_tokens"] == 32768  # Default value (Responses API param)
+            assert "max_tokens" not in call_kwargs
 
     def test_lazy_resolver_loading(self):
         """Test that resolver is lazy-loaded."""
@@ -770,6 +776,27 @@ class TestOllamaChatCompletionPath:
             assert call_kwargs["api_base"] == "http://my-ollama:11434"
 
     @pytest.mark.asyncio
+    async def test_ollama_uses_max_tokens_param_not_max_output_tokens(self, ollama_client, mock_chat_completion_response):
+        """Chat Completions API uses `max_tokens` (not `max_output_tokens` which is Responses API)."""
+        with (
+            patch("multi_mcp.models.litellm_client.litellm.acompletion", new_callable=AsyncMock) as mock_acompletion,
+            patch("multi_mcp.models.litellm_client.log_llm_interaction"),
+            patch.object(ollama_client, "_validate_provider_credentials", return_value=None),
+        ):
+            mock_acompletion.return_value = mock_chat_completion_response
+
+            canonical_name, model_config = ollama_client.resolver.resolve("glm-5.1")
+            await ollama_client.execute(
+                canonical_name=canonical_name,
+                model_config=model_config,
+                messages=[{"role": "user", "content": "Hi"}],
+            )
+
+            call_kwargs = mock_acompletion.call_args[1]
+            assert "max_tokens" in call_kwargs
+            assert "max_output_tokens" not in call_kwargs
+
+    @pytest.mark.asyncio
     async def test_ollama_omits_api_base_when_not_configured(self, ollama_client, mock_chat_completion_response):
         """When settings.ollama_api_base is None, no api_base key is passed (LiteLLM uses its default)."""
         with (
@@ -910,6 +937,73 @@ class TestExtractContentFromChatCompletion:
 
         response = {"choices": [{"message": {"content": 42}}]}
         assert _extract_content_from_chat_completion(response) == ""
+
+
+class TestExtractContentFromResponsesApi:
+    """Tests for the Responses API content extractor (used by OpenAI, Azure, Anthropic, Gemini).
+
+    Previously this function was only tested indirectly via mocked execute() calls. Direct tests
+    pin down dict/object handling, edge cases (None content, empty output), and the bug where
+    `hasattr(response, 'output')` silently failed for dict-shaped responses.
+    """
+
+    def test_extracts_content_from_object_format(self):
+        """Standard MagicMock-style response (LiteLLM ModelResponse object)."""
+        from multi_mcp.models.litellm_client import _extract_content_from_responses_api
+
+        mock = MagicMock()
+        mock_message = MagicMock()
+        mock_message.type = "message"
+        mock_content = MagicMock()
+        mock_content.text = "hello"
+        mock_message.content = [mock_content]
+        mock.output = [mock_message]
+        assert _extract_content_from_responses_api(mock) == "hello"
+
+    def test_extracts_content_from_dict_format(self):
+        """The bug fix: hasattr() didn't work for dicts; now uses isinstance check."""
+        from multi_mcp.models.litellm_client import _extract_content_from_responses_api
+
+        response = {"output": [{"type": "message", "content": [{"type": "output_text", "text": "hello dict"}]}]}
+        assert _extract_content_from_responses_api(response) == "hello dict"
+
+    def test_returns_empty_string_when_no_output_key(self):
+        """Dict without 'output' key → "" (used to silently fail via hasattr)."""
+        from multi_mcp.models.litellm_client import _extract_content_from_responses_api
+
+        assert _extract_content_from_responses_api({}) == ""
+
+    def test_returns_empty_string_when_output_empty(self):
+        """Empty output array → "" (no message to extract)."""
+        from multi_mcp.models.litellm_client import _extract_content_from_responses_api
+
+        assert _extract_content_from_responses_api({"output": []}) == ""
+
+    def test_returns_empty_string_when_no_message_item(self):
+        """Output has items but none are message type (e.g. only reasoning/web_search_call)."""
+        from multi_mcp.models.litellm_client import _extract_content_from_responses_api
+
+        response = {"output": [{"type": "reasoning", "content": "thinking..."}]}
+        assert _extract_content_from_responses_api(response) == ""
+
+    def test_skips_message_with_none_content_and_continues(self):
+        """A message with content=None is skipped; next message with content wins."""
+        from multi_mcp.models.litellm_client import _extract_content_from_responses_api
+
+        response = {
+            "output": [
+                {"type": "message", "content": None},
+                {"type": "message", "content": [{"type": "output_text", "text": "second"}]},
+            ]
+        }
+        assert _extract_content_from_responses_api(response) == "second"
+
+    def test_handles_string_content_fallback(self):
+        """Some providers put plain string content directly (not a list of parts)."""
+        from multi_mcp.models.litellm_client import _extract_content_from_responses_api
+
+        response = {"output": [{"type": "message", "content": "plain string"}]}
+        assert _extract_content_from_responses_api(response) == "plain string"
 
 
 class TestEmptyContentAndErrorHandling:

@@ -12,6 +12,7 @@ from multi_mcp.models.config import PROVIDERS, ModelConfig
 from multi_mcp.models.resolver import ModelResolver
 from multi_mcp.schemas.base import ModelResponse, ModelResponseMetadata
 from multi_mcp.settings import settings
+from multi_mcp.utils.error_humanizer import humanize_error
 from multi_mcp.utils.request_logger import log_llm_interaction
 
 logger = logging.getLogger(__name__)
@@ -23,14 +24,17 @@ def _extract_content_from_responses_api(response) -> str:
     """Extract text from responses API output array.
 
     Handles both OpenAI/Azure ([reasoning/web_search_call, message]) and Anthropic/Gemini ([message]).
-    Supports both object and dict formats (LiteLLM's responses API can return either depending on provider).
+    Supports both object and dict formats (LiteLLM's responses API can return either depending on
+    provider/version). Earlier versions of this function used hasattr() to detect the output array,
+    which silently fails for dicts (dicts have keys, not attributes) — fixed to use isinstance check.
     """
-    # Check if response has output array
-    if not hasattr(response, "output") or not response.output:
+    # Extract output array — supports both object (response.output) and dict (response["output"]) shapes
+    output = response.get("output") if isinstance(response, dict) else getattr(response, "output", None)
+    if not output:
         logger.warning("[RESPONSE_PARSE] Response has no output or empty output array")
         return ""
 
-    for item in response.output:
+    for item in output:
         # LiteLLM's responses API can return items as dicts or objects depending on provider/version
         # Handle both formats for 'type' and 'content' extraction
         item_type = item.get("type") if isinstance(item, dict) else getattr(item, "type", None)
@@ -248,11 +252,16 @@ class LiteLLMClient:
             else:
                 kwargs["input"] = messages
 
-            # Set max_tokens: config value > sensible default
-            # LiteLLM translates this to provider-specific param (num_predict for Ollama).
-            max_tokens = model_config.max_tokens if model_config.max_tokens is not None else DEFAULT_MAX_TOKENS
-            kwargs["max_tokens"] = max_tokens
-            logger.debug(f"[MODEL_CALL] Using max_tokens={max_tokens} ({'config' if model_config.max_tokens else 'default'})")
+            # Set output token limit: config value > sensible default.
+            # Per LiteLLM docs, the Responses API uses `max_output_tokens` while Chat Completions
+            # uses `max_tokens`. Passing `max_tokens` to aresponses() risks silent drop because
+            # `litellm.drop_params=True` is set globally, which would leave output uncapped.
+            max_output = model_config.max_tokens if model_config.max_tokens is not None else DEFAULT_MAX_TOKENS
+            max_tokens_param = "max_tokens" if use_chat_completion else "max_output_tokens"
+            kwargs[max_tokens_param] = max_output
+            logger.debug(
+                f"[MODEL_CALL] Using {max_tokens_param}={max_output} ({'config' if model_config.max_tokens is not None else 'default'})"
+            )
 
             # Enable provider-native web search if requested and supported.
             # Only Responses API providers (OpenAI, Gemini) support the unified web_search tool;
@@ -329,7 +338,9 @@ class LiteLLMClient:
             # logger.exception captures the full traceback — critical for diagnosing
             # non-trivial LiteLLM failures (auth errors, malformed responses, network glitches).
             logger.exception(f"[MODEL_CALL] Model {canonical_name} failed: {e}")
+            # humanize_error sanitizes (strips API keys, caps length) and converts known
+            # failure patterns (Ollama auth, missing models, etc.) into actionable messages.
             return ModelResponse.error_response(
-                error=str(e),
+                error=humanize_error(str(e), canonical_name=canonical_name),
                 model=canonical_name,
             )

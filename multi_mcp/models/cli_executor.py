@@ -12,6 +12,7 @@ from multi_mcp.constants import DEBUG_LOG_MAX_LENGTH, ERROR_PREVIEW_MAX_LENGTH
 from multi_mcp.models.config import ModelConfig
 from multi_mcp.schemas.base import ModelResponse, ModelResponseMetadata
 from multi_mcp.settings import settings
+from multi_mcp.utils.error_humanizer import humanize_error
 from multi_mcp.utils.json_parser import parse_llm_json
 from multi_mcp.utils.request_logger import log_llm_interaction
 
@@ -166,10 +167,22 @@ class CLIExecutor:
                 logger.error(f"[CLI_CALL] {canonical_name} failed with exit code {process.returncode}")
                 logger.debug(f"[CLI_CALL] stderr: {stderr[:DEBUG_LOG_MAX_LENGTH]}")
                 logger.debug(f"[CLI_CALL] stdout: {stdout[:DEBUG_LOG_MAX_LENGTH]}")
+                # humanize_error pattern-matches known CLI failures (e.g. codex "trusted dir",
+                # missing CLI on PATH, auth errors) and returns an actionable message.
+                # Falls through to the raw error preview + install hint when nothing matches.
+                humanized = humanize_error(error_preview or "", canonical_name=canonical_name)
+                # If humanize returned the input unchanged, no pattern matched — keep the
+                # original informative format with stderr preview and install hint.
+                if humanized == error_preview:
+                    error_msg = (
+                        f"CLI '{cli_command}' failed with exit code {process.returncode}. "
+                        f"Error: {error_preview}\n\n"
+                        f"Troubleshooting: {install_hint}"
+                    )
+                else:
+                    error_msg = humanized
                 return ModelResponse.error_response(
-                    error=f"CLI '{cli_command}' failed with exit code {process.returncode}. "
-                    f"Error: {error_preview}\n\n"
-                    f"Troubleshooting: {install_hint}",
+                    error=error_msg,
                     model=canonical_name,
                     latency_ms=latency_ms,
                 )

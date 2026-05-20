@@ -41,16 +41,20 @@ def _model_available(model_name: str) -> bool:
     """Check whether `model_name` can be used through the local Ollama daemon.
 
     Cloud models (`:cloud` suffix) are streamed on-demand from Ollama's cloud
-    and never appear in `/api/tags` — they are available if the daemon is
-    reachable AND the user is signed in (`ollama signin`). For local models,
-    require an exact tag match. For untagged names, match any tag with the
-    same base name (avoids the trap where `qwen3:8b` would seem available
-    when only `qwen3:4b` is installed).
+    and never appear in `/api/tags` — they require the user to have run
+    `ollama signin`. We don't have a cheap way to detect signin state without
+    making a real API call, so cloud models are considered available only
+    when explicitly opted in via OLLAMA_E2E_ENABLE_CLOUD=1. Without that
+    opt-in we skip cloud models cleanly instead of failing with a cryptic
+    auth error mid-test.
+
+    For local models, require an exact tag match. For untagged names, match
+    any tag with the same base name (avoids the trap where `qwen3:8b` would
+    seem available when only `qwen3:4b` is installed).
     """
-    # Cloud models: skip the /api/tags check entirely.
-    # If the daemon is reachable (already verified by caller), they are usable.
+    # Cloud models: opt-in via env var since we can't pre-check signin state.
     if model_name.endswith(":cloud"):
-        return True
+        return os.environ.get("OLLAMA_E2E_ENABLE_CLOUD") == "1"
 
     base = settings.ollama_api_base or "http://localhost:11434"
     try:
@@ -103,7 +107,11 @@ async def test_ollama_end_to_end_via_litellm_client():
 
     if test_model is None:
         configured = [m[1].litellm_model for m in ollama_models]
-        pytest.skip(f"No configured Ollama models available locally. Configured: {configured}. Pull one with `ollama pull <model>`.")
+        pytest.skip(
+            f"No configured Ollama models available. Configured: {configured}. "
+            "For local models: `ollama pull <model>`. "
+            "For cloud models (`:cloud`): run `ollama signin` then set OLLAMA_E2E_ENABLE_CLOUD=1."
+        )
 
     name, cfg = test_model
     client = LiteLLMClient(resolver=resolver)
