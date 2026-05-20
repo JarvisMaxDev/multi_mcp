@@ -96,12 +96,7 @@ def test_parse_nested_fences_with_trailing_text():
     `_CODE_FENCE_RE` was non-greedy and stopped at the first inner closing
     ```` ``` ````, mangling the JSON. Now it's greedy and locks onto the
     OUTERMOST opening + closing pair."""
-    content = (
-        "```json\n"
-        '{"status": "success", "fix": "```python\\nprint(42)\\n```"}\n'
-        "```\n"
-        "Follow-up commentary here."
-    )
+    content = '```json\n{"status": "success", "fix": "```python\\nprint(42)\\n```"}\n```\nFollow-up commentary here.'
     result = parse_llm_json(content)
     assert result is not None
     assert result["status"] == "success"
@@ -210,10 +205,7 @@ def test_parse_preserves_legitimate_analysis_strings_in_json_fields():
     # Case 2: The legacy use case — LLM wrapped its reasoning in
     # <analysis> tags as a PREAMBLE before the JSON. The stripper
     # fallback must still handle this.
-    content2 = (
-        "<analysis>This is my reasoning about the input</analysis>\n"
-        '{"status": "ok", "message": "done"}'
-    )
+    content2 = '<analysis>This is my reasoning about the input</analysis>\n{"status": "ok", "message": "done"}'
     result2 = parse_llm_json(content2)
     assert result2 is not None
     assert result2["status"] == "ok"
