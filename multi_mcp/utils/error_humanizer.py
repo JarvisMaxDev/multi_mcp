@@ -25,8 +25,8 @@ _SECRET_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
     re.compile(r"Bearer\s+[a-zA-Z0-9._-]{20,}", re.IGNORECASE),
     # Google API keys (Gemini, Maps, etc.): AIza followed by 35 chars
     re.compile(r"AIza[0-9A-Za-z_-]{35}"),
-    # AWS access key IDs: AKIA followed by 16 uppercase alphanumerics
-    re.compile(r"AKIA[0-9A-Z]{16}"),
+    # AWS access key IDs: AKIA (permanent) or ASIA (temporary STS) + 16 uppercase alphanumerics
+    re.compile(r"(?:AKIA|ASIA)[0-9A-Z]{16}"),
     # Provider env-var assignments in error messages — catches strings like
     # `ANTHROPIC_API_KEY=sk-...`, `AZURE_API_KEY: '...'`, etc. for any of our
     # known provider env vars. Matches up to the next whitespace, quote, or
@@ -119,7 +119,10 @@ _HUMANIZE_RULES: Final[tuple[_AuthRule, ...]] = (
         ),
     ),
     (
-        re.compile(r"(model .*not found|pull model first|no such model)", re.IGNORECASE),
+        # Require Ollama context — otherwise the regex would match any provider's
+        # NotFoundError (e.g. OpenAI "Model gpt-5-mini not found") and give wrong
+        # "ollama pull" advice. `pull model first` and `no such model` are Ollama-specific.
+        re.compile(r"(ollama.*model .*not found|model .*not found.*ollama|pull model first|no such model)", re.IGNORECASE),
         (
             "Ollama model is not pulled locally. Run `ollama pull <model-name>` "
             "(use the exact name from `ollama list`), then retry. "

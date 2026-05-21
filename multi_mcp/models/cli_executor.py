@@ -242,9 +242,17 @@ class CLIExecutor:
                 humanized = humanize_error(error_preview or "", canonical_name=canonical_name)
                 pattern_matched = "(Original error:" in humanized
                 if not pattern_matched:
+                    # CRITICAL: when no pattern matched, humanize_error returned the SANITIZED
+                    # raw error (with secrets stripped). Use that — NEVER the raw error_preview,
+                    # which may contain provider API keys, Bearer tokens, etc. if a misbehaving
+                    # CLI echoes them in its stderr/stdout. Earlier versions of this code used
+                    # error_preview here and would leak those secrets to the MCP caller.
+                    # Special-case empty input: humanize_error returns "Unknown error..." but
+                    # we prefer the cleaner "(no output)" wording in the failure message.
+                    sanitized_preview = humanized if error_preview else "(no output)"
                     error_msg = (
                         f"CLI '{cli_command}' failed with exit code {process.returncode}. "
-                        f"Error: {error_preview or '(no output)'}\n\n"
+                        f"Error: {sanitized_preview}\n\n"
                         f"Troubleshooting: {install_hint}"
                     )
                 else:

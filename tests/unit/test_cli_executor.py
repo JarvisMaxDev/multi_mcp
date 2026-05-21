@@ -275,6 +275,46 @@ class TestCLIExecutor:
             assert "--skip-git-repo-check" in result.error
 
     @pytest.mark.asyncio
+    async def test_execute_sanitizes_unknown_cli_failure_stderr(self, cli_executor, cli_model_config):
+        """Regression test: when stderr contains an unknown failure pattern AND a secret,
+        the secret must NOT appear in the user-visible error (only the install-hint
+        fallback path is used, but the stderr preview going into that fallback must be sanitized).
+
+        Found by claude+codex in round-6 review — the previous code returned raw `error_preview`
+        when no pattern matched, leaking any secrets echoed by the CLI into stderr.
+        """
+        # Note: the test fixture uses a fake "secret"-shaped value to exercise the sk-* pattern.
+        fake_secret = "sk-FAKE-TEST-VALUE-1234567890abcdef"  # nosec
+        stderr_with_secret = f"Random unique error that matches no humanize rule. config={fake_secret}"
+        mock_process = MagicMock()
+        mock_process.returncode = 137
+        mock_process.communicate = AsyncMock(return_value=(b"", stderr_with_secret.encode()))
+
+        with (
+            patch("shutil.which", return_value="/usr/bin/gemini"),
+            patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
+            patch("multi_mcp.models.cli_executor.log_llm_interaction"),
+        ):
+            mock_exec.return_value = mock_process
+
+            result = await cli_executor.execute(
+                canonical_name="gemini-cli",
+                model_config=cli_model_config,
+                messages=[{"role": "user", "content": "test"}],
+            )
+
+            assert result.status == "error"
+            # The secret value must NOT appear in the user-visible error message
+            assert fake_secret not in result.error, f"Secret leaked: {result.error}"
+            # The redaction marker should be present
+            assert "[REDACTED]" in result.error
+            # The install-hint format is preserved
+            assert "failed with exit code 137" in result.error
+            assert "Troubleshooting:" in result.error
+            # The context around the secret is preserved (sanitized, not replaced)
+            assert "Random unique error" in result.error
+
+    @pytest.mark.asyncio
     async def test_execute_falls_back_to_install_hint_for_unknown_cli_failure(self, cli_executor, cli_model_config):
         """For unrecognized failure modes (no pattern match), preserve the original
         'failed with exit code N + Troubleshooting:' format with install hint.

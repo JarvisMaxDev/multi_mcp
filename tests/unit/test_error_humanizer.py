@@ -37,6 +37,14 @@ class TestSanitization:
         assert "AKIAIOSFODNN7EXAMPLE" not in out
         assert "[REDACTED]" in out
 
+    def test_strips_aws_asia_temporary_key(self):
+        """AWS temporary STS access key IDs (ASIA prefix, used with assumed roles)
+        must also be redacted — the AKIA-only pattern missed these."""
+        raw = "AWS STS error: ASIAEXAMPLETOKEN1234 invalid"
+        out = humanize_error(raw)
+        assert "ASIAEXAMPLETOKEN1234" not in out
+        assert "[REDACTED]" in out
+
     def test_strips_env_var_assignment_in_error(self):
         """A CLI echoing an env-var assignment must not leak the value.
 
@@ -107,6 +115,21 @@ class TestOllamaPatterns:
         out = humanize_error(raw)
         assert "not pulled locally" in out
         assert "ollama pull" in out
+
+    def test_non_ollama_model_not_found_does_not_get_ollama_advice(self):
+        """Regression: previously `model .*not found` matched ANY provider's NotFoundError
+        and incorrectly advised `ollama pull` for OpenAI/Anthropic/Gemini failures.
+
+        The fix requires Ollama context in the regex.
+        """
+        raw = "OpenAI API error: Model gpt-5-mini not found"
+        out = humanize_error(raw)
+        # Must NOT contain Ollama-specific advice
+        assert "ollama pull" not in out
+        assert "ollama list" not in out
+        # Should pass through (or hit a different pattern if any)
+        # At minimum, the original message context should be preserved.
+        assert "gpt-5-mini" in out
 
 
 class TestLitellmPatterns:
