@@ -593,6 +593,69 @@ class TestCLIExecutor:
             assert "OPENAI_API_KEY" not in call_env
 
     @pytest.mark.asyncio
+    async def test_execute_strips_aws_session_and_region(self, cli_executor):
+        """AWS_SESSION_TOKEN/AWS_SECURITY_TOKEN (STS temporary creds) and AWS_REGION_NAME
+        (not secret but discloses deployment region) must also be stripped from every CLI subprocess.
+        """
+        config = ModelConfig(
+            provider="cli",
+            cli_command="claude",
+            cli_args=[],
+            cli_parser="json",
+            cli_env={},
+        )
+        mock_process = MagicMock()
+        mock_process.returncode = 0
+        mock_process.communicate = AsyncMock(return_value=(b'{"result":"ok","is_error":false}', b""))
+
+        with (
+            patch("shutil.which", return_value="/usr/bin/claude"),
+            patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
+            patch("multi_mcp.models.cli_executor.settings") as mock_settings,
+            patch("multi_mcp.models.cli_executor.log_llm_interaction"),
+            patch.dict(
+                "os.environ",
+                {
+                    "PATH": "/usr/bin",
+                    # Temporary STS credentials in parent env (assumed role)
+                    "AWS_SESSION_TOKEN": "FQoDYXdzE...long-session-token...",  # nosec
+                    "AWS_SECURITY_TOKEN": "legacy-name-for-session-token",  # nosec
+                    "AWS_REGION_NAME": "us-west-2",
+                    "AZURE_API_VERSION": "2025-04-01-preview",
+                },
+                clear=True,
+            ),
+        ):
+            mock_settings.anthropic_api_key = "claude-key"
+            mock_settings.openai_api_key = None
+            mock_settings.gemini_api_key = None
+            mock_settings.openrouter_api_key = None
+            mock_settings.ollama_api_key = None
+            mock_settings.lm_studio_api_key = None
+            mock_settings.dashscope_api_key = None
+            mock_settings.azure_api_key = None
+            mock_settings.azure_api_base = None
+            mock_settings.azure_api_version = "2025-04-01-preview"
+            mock_settings.aws_access_key_id = None
+            mock_settings.aws_secret_access_key = None
+            mock_settings.aws_region_name = "us-east-1"
+            mock_settings.model_timeout_seconds = 120
+
+            mock_exec.return_value = mock_process
+            await cli_executor.execute(
+                canonical_name="claude-cli",
+                model_config=config,
+                messages=[{"role": "user", "content": "test"}],
+            )
+
+            call_env = mock_exec.call_args[1]["env"]
+            # All AWS session-related and region keys, plus Azure version, must be ABSENT
+            assert "AWS_SESSION_TOKEN" not in call_env, f"AWS_SESSION_TOKEN leaked: {call_env.get('AWS_SESSION_TOKEN')!r}"
+            assert "AWS_SECURITY_TOKEN" not in call_env, f"AWS_SECURITY_TOKEN leaked: {call_env.get('AWS_SECURITY_TOKEN')!r}"
+            assert "AWS_REGION_NAME" not in call_env, f"AWS_REGION_NAME leaked: {call_env.get('AWS_REGION_NAME')!r}"
+            assert "AZURE_API_VERSION" not in call_env, f"AZURE_API_VERSION leaked: {call_env.get('AZURE_API_VERSION')!r}"
+
+    @pytest.mark.asyncio
     async def test_execute_strips_azure_and_aws_credentials(self, cli_executor):
         """Azure and AWS credentials (API-only providers with no CLI consumer) must be
         stripped from every CLI subprocess. They are written to os.environ by

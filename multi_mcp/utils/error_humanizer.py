@@ -49,6 +49,19 @@ def _sanitize(error: str) -> str:
     return error
 
 
+def sanitize_for_log(raw: str) -> str:
+    """Redact secrets and cap length without applying friendly pattern rewrites.
+
+    Intended for use in `logger.debug(...)`, `logger.error(...)`, etc. where we
+    want the original error context for debugging but must not persist credentials.
+    Unlike `humanize_error`, this never adds "(Original error: ...)" wrapping —
+    just strips secrets and truncates.
+    """
+    if not raw:
+        return ""
+    return _sanitize(raw)
+
+
 # Each rule: (pattern → friendly message generator).
 # The generator receives the canonical model name and the original (sanitized) error.
 # Patterns match against the lower-cased error message for robustness.

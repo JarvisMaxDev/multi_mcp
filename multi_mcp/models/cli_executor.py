@@ -12,7 +12,7 @@ from multi_mcp.constants import DEBUG_LOG_MAX_LENGTH, ERROR_PREVIEW_MAX_LENGTH
 from multi_mcp.models.config import ModelConfig
 from multi_mcp.schemas.base import ModelResponse, ModelResponseMetadata
 from multi_mcp.settings import settings
-from multi_mcp.utils.error_humanizer import humanize_error
+from multi_mcp.utils.error_humanizer import humanize_error, sanitize_for_log
 from multi_mcp.utils.json_parser import parse_llm_json
 from multi_mcp.utils.request_logger import log_llm_interaction
 
@@ -88,12 +88,21 @@ class CLIExecutor:
             "OLLAMA_API_KEY",
             "LM_STUDIO_API_KEY",
             "DASHSCOPE_API_KEY",
-            # Azure OpenAI (API-only, no CLI consumer today)
+            # Azure OpenAI (API-only, no CLI consumer today).
+            # AZURE_API_VERSION and AZURE_API_BASE aren't credentials but they disclose
+            # internal deployment shape (deployment URL, contract version) — strip them too.
             "AZURE_API_KEY",
-            "AZURE_API_BASE",  # URL of internal deployment — not secret per se, but worth limiting exposure
-            # AWS Bedrock (API-only, no CLI consumer today)
+            "AZURE_API_BASE",
+            "AZURE_API_VERSION",
+            # AWS Bedrock (API-only, no CLI consumer today). AWS_SESSION_TOKEN /
+            # AWS_SECURITY_TOKEN are temporary STS credentials used with assumed roles —
+            # useless without the access key pair we already strip, but defense-in-depth.
+            # AWS_REGION_NAME isn't secret but discloses deployment region.
             "AWS_ACCESS_KEY_ID",
             "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "AWS_SECURITY_TOKEN",
+            "AWS_REGION_NAME",
         )
         for key in ALL_PROVIDER_KEYS:
             env.pop(key, None)
@@ -124,10 +133,14 @@ class CLIExecutor:
             settings_secrets["AZURE_API_KEY"] = settings.azure_api_key
         if settings.azure_api_base:
             settings_secrets["AZURE_API_BASE"] = settings.azure_api_base
+        if settings.azure_api_version:
+            settings_secrets["AZURE_API_VERSION"] = settings.azure_api_version
         if settings.aws_access_key_id:
             settings_secrets["AWS_ACCESS_KEY_ID"] = settings.aws_access_key_id
         if settings.aws_secret_access_key:
             settings_secrets["AWS_SECRET_ACCESS_KEY"] = settings.aws_secret_access_key
+        if settings.aws_region_name:
+            settings_secrets["AWS_REGION_NAME"] = settings.aws_region_name
 
         # Allowlist: which provider key(s) each first-party CLI legitimately needs.
         # Keep this list narrow — extending it without a real consumer use case
@@ -216,8 +229,11 @@ class CLIExecutor:
 
                 install_hint = self.get_install_hint(cli_command)
                 logger.error(f"[CLI_CALL] {canonical_name} failed with exit code {process.returncode}")
-                logger.debug(f"[CLI_CALL] stderr: {stderr[:DEBUG_LOG_MAX_LENGTH]}")
-                logger.debug(f"[CLI_CALL] stdout: {stdout[:DEBUG_LOG_MAX_LENGTH]}")
+                # Sanitize raw stderr/stdout before logging — a CLI in debug mode might
+                # echo provider keys, Bearer tokens, or env-var assignments. logs/*.llm.json
+                # would otherwise persist secrets even though the caller gets a humanized error.
+                logger.debug(f"[CLI_CALL] stderr: {sanitize_for_log(stderr[:DEBUG_LOG_MAX_LENGTH])}")
+                logger.debug(f"[CLI_CALL] stdout: {sanitize_for_log(stdout[:DEBUG_LOG_MAX_LENGTH])}")
                 # humanize_error pattern-matches known CLI failures (e.g. codex "trusted dir",
                 # missing CLI on PATH, auth errors) and returns an actionable message.
                 # Falls through to the raw error preview + install hint when nothing matches.
@@ -319,7 +335,7 @@ class CLIExecutor:
             # confusingly suggests a subprocess crash. The CLI actually ran fine —
             # it just reported a model-side error — so surface that cleanly.
             latency_ms = int((time.perf_counter() - start_time) * 1000)
-            logger.error(f"[CLI_CALL] {canonical_name} returned application error: {e}")
+            logger.error(f"[CLI_CALL] {canonical_name} returned application error: {sanitize_for_log(str(e))}")
             # Sanitize the error message — application errors may embed tokens
             # (e.g. a CLI echoing back the request that included a key).
             response = ModelResponse.error_response(
@@ -355,7 +371,10 @@ class CLIExecutor:
             # the TimeoutError branch — don't let kill()+communicate hang forever).
             await self._terminate_subprocess(process, "failed")
 
-            logger.error(f"[CLI_CALL] {canonical_name} failed with exception: {type(e).__name__}: {e}")
+            logger.error(f"[CLI_CALL] {canonical_name} failed with exception: {type(e).__name__}: {sanitize_for_log(str(e))}")
+            # Note: exc_info=True logs the full traceback including local variables in some
+            # Python configurations. We accept this trade-off for debuggability — the traceback
+            # itself rarely contains user secrets (those would be in subprocess output, sanitized above).
             logger.debug("[CLI_CALL] Full error details", exc_info=True)
             # Sanitize through humanize_error so any embedded secrets get redacted
             # and known failure patterns produce actionable messages.

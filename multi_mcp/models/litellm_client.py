@@ -12,7 +12,7 @@ from multi_mcp.models.config import PROVIDERS, ModelConfig
 from multi_mcp.models.resolver import ModelResolver
 from multi_mcp.schemas.base import ModelResponse, ModelResponseMetadata
 from multi_mcp.settings import settings
-from multi_mcp.utils.error_humanizer import humanize_error
+from multi_mcp.utils.error_humanizer import humanize_error, sanitize_for_log
 from multi_mcp.utils.request_logger import log_llm_interaction
 
 logger = logging.getLogger(__name__)
@@ -341,7 +341,9 @@ class LiteLLMClient:
         except Exception as e:
             # logger.exception captures the full traceback — critical for diagnosing
             # non-trivial LiteLLM failures (auth errors, malformed responses, network glitches).
-            logger.exception(f"[MODEL_CALL] Model {canonical_name} failed: {e}")
+            # Sanitize the message portion to redact any API keys LiteLLM may have echoed
+            # in the exception text. The traceback itself is logged separately by logger.exception.
+            logger.exception(f"[MODEL_CALL] Model {canonical_name} failed: {sanitize_for_log(str(e))}")
             # humanize_error sanitizes (strips API keys, caps length) and converts known
             # failure patterns (Ollama auth, missing models, etc.) into actionable messages.
             return ModelResponse.error_response(

@@ -126,6 +126,48 @@ class TestLitellmPatterns:
         assert ".env" in out
 
 
+class TestSanitizeForLog:
+    """Tests for the log-only sanitizer (no friendly pattern rewriting, just secret stripping)."""
+
+    def test_redacts_secrets_without_pattern_rewriting(self):
+        """sanitize_for_log preserves the original error structure but strips secrets.
+
+        Unlike humanize_error which prepends a friendly message and appends
+        '(Original error: ...)', this just returns the sanitized input.
+        """
+        from multi_mcp.utils.error_humanizer import sanitize_for_log
+
+        raw = "ConnectionError: connection refused to http://localhost:11434"
+        out = sanitize_for_log(raw)
+        # Same shape (no friendly preamble, no Original error wrapping)
+        assert out == raw
+
+    def test_strips_secret_but_keeps_context(self):
+        """Secret material is redacted; rest of message intact for debugging."""
+        from multi_mcp.utils.error_humanizer import sanitize_for_log
+
+        raw = "Failed: API key 'AIzaSyA-1234567890AbCdEfGhIjKlMnOpQrStUvWx' invalid"
+        out = sanitize_for_log(raw)
+        assert "AIzaSyA" not in out
+        assert "[REDACTED]" in out
+        # Context preserved
+        assert "Failed: API key" in out
+        assert "invalid" in out
+
+    def test_empty_input_returns_empty(self):
+        from multi_mcp.utils.error_humanizer import sanitize_for_log
+
+        assert sanitize_for_log("") == ""
+
+    def test_truncates_long_input(self):
+        from multi_mcp.utils.error_humanizer import sanitize_for_log
+
+        raw = "x" * 1000
+        out = sanitize_for_log(raw)
+        assert len(out) < 600  # ~500 cap + truncation marker
+        assert "truncated" in out
+
+
 class TestFallthrough:
     """Unknown errors pass through (sanitized but unchanged in meaning)."""
 
