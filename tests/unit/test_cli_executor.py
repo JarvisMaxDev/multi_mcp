@@ -593,6 +593,74 @@ class TestCLIExecutor:
             assert "OPENAI_API_KEY" not in call_env
 
     @pytest.mark.asyncio
+    async def test_execute_strips_azure_and_aws_credentials(self, cli_executor):
+        """Azure and AWS credentials (API-only providers with no CLI consumer) must be
+        stripped from every CLI subprocess. They are written to os.environ by
+        Settings.set_provider_env_vars at startup, so without explicit stripping they
+        would inherit into any CLI subprocess.
+        """
+        config = ModelConfig(
+            provider="cli",
+            cli_command="claude",  # any first-party CLI
+            cli_args=[],
+            cli_parser="json",
+            cli_env={},
+        )
+
+        mock_process = MagicMock()
+        mock_process.returncode = 0
+        mock_process.communicate = AsyncMock(return_value=(b'{"result":"ok","is_error":false}', b""))
+
+        with (
+            patch("shutil.which", return_value="/usr/bin/claude"),
+            patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
+            patch("multi_mcp.models.cli_executor.settings") as mock_settings,
+            patch("multi_mcp.models.cli_executor.log_llm_interaction"),
+            # Simulate Azure/AWS keys present in the parent env (written there by
+            # Settings.set_provider_env_vars or via shell rc).
+            patch.dict(
+                "os.environ",
+                {
+                    "PATH": "/usr/bin",
+                    "AZURE_API_KEY": "azure-secret",
+                    "AZURE_API_BASE": "https://internal.openai.azure.com/",
+                    "AWS_ACCESS_KEY_ID": "AKIAIOSFODNN7EXAMPLE",
+                    "AWS_SECRET_ACCESS_KEY": "aws-secret-key-value",
+                },
+                clear=True,
+            ),
+        ):
+            mock_settings.anthropic_api_key = "claude-key"
+            mock_settings.openai_api_key = None
+            mock_settings.gemini_api_key = None
+            mock_settings.openrouter_api_key = None
+            mock_settings.ollama_api_key = None
+            mock_settings.lm_studio_api_key = None
+            mock_settings.dashscope_api_key = None
+            mock_settings.azure_api_key = "azure-from-settings"
+            mock_settings.azure_api_base = "https://from-settings.azure.com/"
+            mock_settings.aws_access_key_id = "AKIAFROMSETTINGS01"
+            mock_settings.aws_secret_access_key = "aws-from-settings"
+            mock_settings.model_timeout_seconds = 120
+
+            mock_exec.return_value = mock_process
+            await cli_executor.execute(
+                canonical_name="claude-cli",
+                model_config=config,
+                messages=[{"role": "user", "content": "test"}],
+            )
+
+            call_env = mock_exec.call_args[1]["env"]
+            # Allowed: claude gets its anthropic key
+            assert call_env.get("ANTHROPIC_API_KEY") == "claude-key"
+            # NOT allowed: Azure and AWS credentials must be ABSENT, both inherited
+            # from shell env AND Settings-injected values.
+            assert "AZURE_API_KEY" not in call_env, f"AZURE_API_KEY leaked: {call_env.get('AZURE_API_KEY')!r}"
+            assert "AZURE_API_BASE" not in call_env, f"AZURE_API_BASE leaked: {call_env.get('AZURE_API_BASE')!r}"
+            assert "AWS_ACCESS_KEY_ID" not in call_env, f"AWS_ACCESS_KEY_ID leaked: {call_env.get('AWS_ACCESS_KEY_ID')!r}"
+            assert "AWS_SECRET_ACCESS_KEY" not in call_env, f"AWS_SECRET_ACCESS_KEY leaked: {call_env.get('AWS_SECRET_ACCESS_KEY')!r}"
+
+    @pytest.mark.asyncio
     async def test_execute_custom_cli_cli_env_explicit_opt_in_still_works(self, cli_executor):
         """Custom CLI can request keys explicitly via cli_env (escape hatch).
 

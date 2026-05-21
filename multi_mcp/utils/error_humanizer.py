@@ -18,12 +18,25 @@ from typing import Final
 # These never need to leak to the AI assistant caller.
 _MAX_ERROR_LENGTH: Final[int] = 500
 _SECRET_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
-    # OpenAI-style keys: sk-..., sk-proj-..., sk-ant-...
+    # OpenAI-style keys: sk-..., sk-proj-...
+    # Also covers sk-ant-... (Anthropic) since sk-ant-* is a strict subset of sk-*.
     re.compile(r"sk-[a-zA-Z0-9_-]{20,}"),
-    # Generic Bearer tokens
+    # Generic Bearer tokens (Authorization: Bearer ...)
     re.compile(r"Bearer\s+[a-zA-Z0-9._-]{20,}", re.IGNORECASE),
-    # Anthropic-style: sk-ant-...
-    re.compile(r"sk-ant-[a-zA-Z0-9_-]{20,}"),
+    # Google API keys (Gemini, Maps, etc.): AIza followed by 35 chars
+    re.compile(r"AIza[0-9A-Za-z_-]{35}"),
+    # AWS access key IDs: AKIA followed by 16 uppercase alphanumerics
+    re.compile(r"AKIA[0-9A-Z]{16}"),
+    # Provider env-var assignments in error messages — catches strings like
+    # `ANTHROPIC_API_KEY=sk-...`, `AZURE_API_KEY: '...'`, etc. for any of our
+    # known provider env vars. Matches up to the next whitespace, quote, or
+    # punctuation that typically delimits an assignment value.
+    re.compile(
+        r"['\"]?(?:OPENAI|ANTHROPIC|GEMINI|OPENROUTER|OLLAMA|LM_STUDIO|"
+        r"DASHSCOPE|AZURE|AWS_SECRET_ACCESS_KEY|AWS_ACCESS_KEY_ID)"
+        r"(?:_API_KEY|_API_BASE)?['\"]?\s*[:=]\s*['\"]?[^'\"\s,;}]+",
+        re.IGNORECASE,
+    ),
 )
 
 

@@ -75,6 +75,11 @@ class CLIExecutor:
         # Custom or wrapper CLIs (basename not in CLI_ALLOWED_KEYS) receive NO
         # provider credentials by default — users must opt them in explicitly via
         # `cli_env: {VAR: "${VAR}"}` in config.yaml.
+        #
+        # We also strip Azure and AWS credentials. These are API-only providers
+        # (Bedrock, Azure OpenAI) with no CLI consumer in the current allowlist,
+        # but Settings.set_provider_env_vars writes them to os.environ at startup,
+        # so they would otherwise leak to every CLI subprocess.
         ALL_PROVIDER_KEYS = (
             "ANTHROPIC_API_KEY",
             "OPENAI_API_KEY",
@@ -83,6 +88,12 @@ class CLIExecutor:
             "OLLAMA_API_KEY",
             "LM_STUDIO_API_KEY",
             "DASHSCOPE_API_KEY",
+            # Azure OpenAI (API-only, no CLI consumer today)
+            "AZURE_API_KEY",
+            "AZURE_API_BASE",  # URL of internal deployment — not secret per se, but worth limiting exposure
+            # AWS Bedrock (API-only, no CLI consumer today)
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
         )
         for key in ALL_PROVIDER_KEYS:
             env.pop(key, None)
@@ -106,6 +117,17 @@ class CLIExecutor:
             settings_secrets["LM_STUDIO_API_KEY"] = settings.lm_studio_api_key
         if settings.dashscope_api_key:
             settings_secrets["DASHSCOPE_API_KEY"] = settings.dashscope_api_key
+        # Azure and AWS — only exposed if a user explicitly opts in via cli_env
+        # (no CLI is on the allowlist for these today, but the values must be
+        # in settings_secrets so ${AZURE_API_KEY} etc. can expand if requested).
+        if settings.azure_api_key:
+            settings_secrets["AZURE_API_KEY"] = settings.azure_api_key
+        if settings.azure_api_base:
+            settings_secrets["AZURE_API_BASE"] = settings.azure_api_base
+        if settings.aws_access_key_id:
+            settings_secrets["AWS_ACCESS_KEY_ID"] = settings.aws_access_key_id
+        if settings.aws_secret_access_key:
+            settings_secrets["AWS_SECRET_ACCESS_KEY"] = settings.aws_secret_access_key
 
         # Allowlist: which provider key(s) each first-party CLI legitimately needs.
         # Keep this list narrow — extending it without a real consumer use case

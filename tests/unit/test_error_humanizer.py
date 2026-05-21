@@ -23,6 +23,42 @@ class TestSanitization:
         out = humanize_error(raw)
         assert "sk-ant-api03" not in out
 
+    def test_strips_google_aiza_key(self):
+        """Gemini API keys (AIza followed by 35 chars) must be redacted."""
+        raw = "Failed: API key 'AIzaSyA-1234567890AbCdEfGhIjKlMnOpQrStUvWx' is invalid"
+        out = humanize_error(raw)
+        assert "AIzaSy" not in out
+        assert "[REDACTED]" in out
+
+    def test_strips_aws_akia_key(self):
+        """AWS access key IDs (AKIA + 16 uppercase alphanumerics) must be redacted."""
+        raw = "AWS error: access denied for AKIAIOSFODNN7EXAMPLE"
+        out = humanize_error(raw)
+        assert "AKIAIOSFODNN7EXAMPLE" not in out
+        assert "[REDACTED]" in out
+
+    def test_strips_env_var_assignment_in_error(self):
+        """A CLI echoing an env-var assignment must not leak the value.
+
+        The test fixture intentionally avoids `sk-...` shape so we exercise the
+        env-assignment pattern, not the OpenAI-key pattern.
+        """
+        # Note: test fixture uses an obviously-fake placeholder; semgrep may still
+        # heuristically flag this, but it's just a dummy value.
+        fake_value = "TEST_FAKE_VALUE_NOT_REAL_xyz123"  # nosec
+        raw = f"Bad config: ANTHROPIC_API_KEY={fake_value} found in env"
+        out = humanize_error(raw)
+        assert fake_value not in out
+        assert "[REDACTED]" in out
+
+    def test_strips_azure_env_assignment(self):
+        """Azure key in env-var assignment format must be redacted."""
+        fake_azure = "TEST_FAKE_AZURE_KEY_NOT_REAL_abc"  # nosec
+        raw = f"Azure error: AZURE_API_KEY: '{fake_azure}' invalid"
+        out = humanize_error(raw)
+        assert fake_azure not in out
+        assert "[REDACTED]" in out
+
     def test_truncates_very_long_error(self):
         raw = "x" * 1000
         out = humanize_error(raw)
