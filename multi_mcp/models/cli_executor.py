@@ -62,46 +62,75 @@ class CLIExecutor:
         # CLI that's only reachable via a custom PATH set in cli_env would be
         # rejected before we even try to launch it.
         env = os.environ.copy()
-        # Defense-in-depth: strip qwen-only credentials INHERITED from parent
-        # env for non-qwen CLIs. The Settings-injection block below already
-        # gates these keys on cli_executable == "qwen", but `os.environ.copy()`
-        # above would otherwise leak them into claude/codex/gemini subprocesses
-        # if the user has them set via shell rc or ~/.multi_mcp/.env.
-        if cli_executable != "qwen":
-            for qwen_only_key in ("OLLAMA_API_KEY", "LM_STUDIO_API_KEY", "DASHSCOPE_API_KEY"):
-                env.pop(qwen_only_key, None)
 
-        # Inject API keys from settings into environment for expansion
-        # This allows ${ANTHROPIC_API_KEY} etc. to work even if not in os.environ
+        # Per-CLI credential gating (defense-in-depth against supply-chain attacks).
+        #
+        # Threat model: a compromised CLI binary (e.g. malicious npm postinstall in
+        # @anthropic-ai/claude-code or @openai/codex) can trivially exfiltrate
+        # `process.env` via a fetch() — no shell access needed. By stripping ALL
+        # known provider keys from the inherited env and re-injecting only the one
+        # each CLI legitimately needs, we limit the blast radius to that one provider.
+        #
+        # This generalizes the existing qwen-only gating pattern to all CLIs.
+        # Custom or wrapper CLIs (basename not in CLI_ALLOWED_KEYS) receive NO
+        # provider credentials by default — users must opt them in explicitly via
+        # `cli_env: {VAR: "${VAR}"}` in config.yaml.
+        ALL_PROVIDER_KEYS = (
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "GEMINI_API_KEY",
+            "OPENROUTER_API_KEY",
+            "OLLAMA_API_KEY",
+            "LM_STUDIO_API_KEY",
+            "DASHSCOPE_API_KEY",
+        )
+        for key in ALL_PROVIDER_KEYS:
+            env.pop(key, None)
+
+        # Snapshot configured credentials. Pulled from Settings (the canonical
+        # source) rather than re-reading the just-stripped env. Used both for
+        # allowlist re-injection below AND for ${VAR} expansion in cli_env even
+        # when a custom CLI is not on the allowlist.
+        settings_secrets: dict[str, str] = {}
         if settings.anthropic_api_key:
-            env["ANTHROPIC_API_KEY"] = settings.anthropic_api_key
+            settings_secrets["ANTHROPIC_API_KEY"] = settings.anthropic_api_key
         if settings.openai_api_key:
-            env["OPENAI_API_KEY"] = settings.openai_api_key
+            settings_secrets["OPENAI_API_KEY"] = settings.openai_api_key
         if settings.gemini_api_key:
-            env["GEMINI_API_KEY"] = settings.gemini_api_key
+            settings_secrets["GEMINI_API_KEY"] = settings.gemini_api_key
         if settings.openrouter_api_key:
-            env["OPENROUTER_API_KEY"] = settings.openrouter_api_key
-        # CLI-only keys: forwarded ONLY to qwen-cli (the sole consumer), to
-        # keep these credentials out of unrelated CLI subprocess environments.
-        # Qwen talks to Ollama / LM Studio / DashScope via its OpenAI-compatible
-        # mode and reads these keys from os.environ. Other CLIs (claude, codex,
-        # gemini) must not receive them — principle of least privilege.
-        if cli_executable == "qwen":
-            if settings.ollama_api_key:
-                env["OLLAMA_API_KEY"] = settings.ollama_api_key
-            if settings.lm_studio_api_key:
-                env["LM_STUDIO_API_KEY"] = settings.lm_studio_api_key
-            if settings.dashscope_api_key:
-                env["DASHSCOPE_API_KEY"] = settings.dashscope_api_key
+            settings_secrets["OPENROUTER_API_KEY"] = settings.openrouter_api_key
+        if settings.ollama_api_key:
+            settings_secrets["OLLAMA_API_KEY"] = settings.ollama_api_key
+        if settings.lm_studio_api_key:
+            settings_secrets["LM_STUDIO_API_KEY"] = settings.lm_studio_api_key
+        if settings.dashscope_api_key:
+            settings_secrets["DASHSCOPE_API_KEY"] = settings.dashscope_api_key
+
+        # Allowlist: which provider key(s) each first-party CLI legitimately needs.
+        # Keep this list narrow — extending it without a real consumer use case
+        # weakens the supply-chain defense.
+        CLI_ALLOWED_KEYS: dict[str, tuple[str, ...]] = {
+            "claude": ("ANTHROPIC_API_KEY",),
+            "codex": ("OPENAI_API_KEY",),
+            "gemini": ("GEMINI_API_KEY",),
+            "qwen": ("OLLAMA_API_KEY", "LM_STUDIO_API_KEY", "DASHSCOPE_API_KEY"),
+        }
+        for allowed_key in CLI_ALLOWED_KEYS.get(cli_executable, ()):
+            if allowed_key in settings_secrets:
+                env[allowed_key] = settings_secrets[allowed_key]
 
         # Now expand variables in cli_env (e.g., ${ANTHROPIC_API_KEY}).
         # Build a stable lookup map that contains all cli_env keys upfront so
         # cross-key references resolve regardless of YAML insertion order.
-        # Without this, `A=${B}` declared before `B=value` in cli_env would
-        # leave A unresolved because B isn't in env yet at A's expansion time.
         # Same-name variables in os.environ are still respected (process env
         # takes precedence on conflicts via dict merge order).
-        cli_env_lookup: dict[str, str] = {**model_config.cli_env, **env}
+        #
+        # Critical: include settings_secrets in the lookup so ${ANTHROPIC_API_KEY}
+        # still expands even for a custom CLI that isn't on the allowlist — the
+        # user opting in via cli_env should get the canonical Settings value, not
+        # whatever happens to be in the just-stripped env.
+        cli_env_lookup: dict[str, str] = {**model_config.cli_env, **settings_secrets, **env}
         for key, value in model_config.cli_env.items():
             expanded = self._expand_env_vars(value, cli_env_lookup)
             env[key] = expanded

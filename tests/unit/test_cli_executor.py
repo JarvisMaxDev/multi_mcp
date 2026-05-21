@@ -432,11 +432,14 @@ class TestCLIExecutor:
         assert "Ensure 'unknown-cli' is installed" in hint
 
     @pytest.mark.asyncio
-    async def test_execute_injects_api_keys(self, cli_executor):
-        """Test that API keys from settings are injected into environment."""
+    async def test_execute_injects_allowed_api_key_for_first_party_cli(self, cli_executor):
+        """First-party CLIs on the allowlist (claude/codex/gemini/qwen) receive their key.
+
+        cli_env-driven ${VAR} expansion must also work for the allowed key.
+        """
         config = ModelConfig(
             provider="cli",
-            cli_command="test-cli",
+            cli_command="claude",  # on the allowlist for ANTHROPIC_API_KEY
             cli_args=[],
             cli_parser="text",
             cli_env={"API_KEY": "${ANTHROPIC_API_KEY}"},
@@ -447,35 +450,193 @@ class TestCLIExecutor:
         mock_process.communicate = AsyncMock(return_value=(b"Success", b""))
 
         with (
-            patch("shutil.which", return_value="/usr/bin/test-cli"),
+            patch("shutil.which", return_value="/usr/bin/claude"),
             patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
             patch("multi_mcp.models.cli_executor.settings") as mock_settings,
             patch("multi_mcp.models.cli_executor.log_llm_interaction"),
+            patch.dict("os.environ", {"PATH": "/usr/bin"}, clear=True),
         ):
             mock_settings.anthropic_api_key = "test-key"
             mock_settings.openai_api_key = None
             mock_settings.gemini_api_key = None
             mock_settings.openrouter_api_key = None
+            mock_settings.ollama_api_key = None
+            mock_settings.lm_studio_api_key = None
+            mock_settings.dashscope_api_key = None
             mock_settings.model_timeout_seconds = 120
 
             mock_exec.return_value = mock_process
 
             result = await cli_executor.execute(
-                canonical_name="test-cli",
+                canonical_name="claude-cli",
                 model_config=config,
                 messages=[{"role": "user", "content": "Test"}],
             )
 
-            # Verify environment was passed with API keys
-            call_kwargs = mock_exec.call_args[1]
-            assert "env" in call_kwargs
-            # The env should have ANTHROPIC_API_KEY set
-            assert "ANTHROPIC_API_KEY" in call_kwargs["env"]
-            assert call_kwargs["env"]["ANTHROPIC_API_KEY"] is not None
-            # And API_KEY should be expanded (not the template string)
-            assert "API_KEY" in call_kwargs["env"]
-            assert not call_kwargs["env"]["API_KEY"].startswith("${")  # Verify it was expanded
+            call_env = mock_exec.call_args[1]["env"]
+            # Anthropic key is the allowed one for claude — must be present
+            assert call_env.get("ANTHROPIC_API_KEY") == "test-key"
+            # And API_KEY (from cli_env) should be expanded to the same value
+            assert call_env.get("API_KEY") == "test-key"
             assert result.status == "success"
+
+    @pytest.mark.asyncio
+    async def test_execute_strips_unrelated_keys_per_cli(self, cli_executor):
+        """Each first-party CLI sees ONLY its own provider key, not others.
+
+        Defense against supply-chain attacks: a compromised claude-code binary
+        can't exfiltrate OPENAI_API_KEY or GEMINI_API_KEY because they were
+        never in its environment.
+        """
+        config = ModelConfig(
+            provider="cli",
+            cli_command="claude",
+            cli_args=[],
+            cli_parser="json",
+            cli_env={},
+        )
+
+        mock_process = MagicMock()
+        mock_process.returncode = 0
+        mock_process.communicate = AsyncMock(return_value=(b'{"result":"ok","is_error":false}', b""))
+
+        with (
+            patch("shutil.which", return_value="/usr/bin/claude"),
+            patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
+            patch("multi_mcp.models.cli_executor.settings") as mock_settings,
+            patch("multi_mcp.models.cli_executor.log_llm_interaction"),
+            # Simulate the realistic threat: ALL provider keys present in
+            # the parent shell (loaded from .env files by Settings).
+            patch.dict(
+                "os.environ",
+                {
+                    "PATH": "/usr/bin",
+                    "ANTHROPIC_API_KEY": "shell-anthropic",
+                    "OPENAI_API_KEY": "shell-openai",
+                    "GEMINI_API_KEY": "shell-gemini",
+                    "OPENROUTER_API_KEY": "shell-openrouter",
+                },
+                clear=True,
+            ),
+        ):
+            mock_settings.anthropic_api_key = "settings-anthropic"
+            mock_settings.openai_api_key = "settings-openai"
+            mock_settings.gemini_api_key = "settings-gemini"
+            mock_settings.openrouter_api_key = "settings-openrouter"
+            mock_settings.ollama_api_key = None
+            mock_settings.lm_studio_api_key = None
+            mock_settings.dashscope_api_key = None
+            mock_settings.model_timeout_seconds = 120
+
+            mock_exec.return_value = mock_process
+            await cli_executor.execute(
+                canonical_name="claude-cli",
+                model_config=config,
+                messages=[{"role": "user", "content": "test"}],
+            )
+
+            call_env = mock_exec.call_args[1]["env"]
+            # Allowed: claude gets ANTHROPIC_API_KEY (from Settings, not shell)
+            assert call_env.get("ANTHROPIC_API_KEY") == "settings-anthropic"
+            # NOT allowed: claude must NOT see other providers' keys, even though
+            # they were in the inherited shell env.
+            assert "OPENAI_API_KEY" not in call_env, f"OPENAI_API_KEY leaked: {call_env.get('OPENAI_API_KEY')!r}"
+            assert "GEMINI_API_KEY" not in call_env, f"GEMINI_API_KEY leaked: {call_env.get('GEMINI_API_KEY')!r}"
+            assert "OPENROUTER_API_KEY" not in call_env, f"OPENROUTER_API_KEY leaked: {call_env.get('OPENROUTER_API_KEY')!r}"
+
+    @pytest.mark.asyncio
+    async def test_execute_custom_cli_gets_no_keys_by_default(self, cli_executor):
+        """A custom CLI (not on the allowlist) receives NO provider keys by default.
+
+        Users must opt in explicitly via cli_env in config.yaml. This is the
+        defense-in-depth contract: unknown CLIs are untrusted until explicitly
+        granted credentials.
+        """
+        config = ModelConfig(
+            provider="cli",
+            cli_command="my-custom-cli",  # NOT on allowlist
+            cli_args=[],
+            cli_parser="text",
+            cli_env={},
+        )
+
+        mock_process = MagicMock()
+        mock_process.returncode = 0
+        mock_process.communicate = AsyncMock(return_value=(b"ok", b""))
+
+        with (
+            patch("shutil.which", return_value="/usr/bin/my-custom-cli"),
+            patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
+            patch("multi_mcp.models.cli_executor.settings") as mock_settings,
+            patch("multi_mcp.models.cli_executor.log_llm_interaction"),
+            patch.dict("os.environ", {"PATH": "/usr/bin", "ANTHROPIC_API_KEY": "shell-key"}, clear=True),
+        ):
+            mock_settings.anthropic_api_key = "settings-key"
+            mock_settings.openai_api_key = "settings-openai"
+            mock_settings.gemini_api_key = None
+            mock_settings.openrouter_api_key = None
+            mock_settings.ollama_api_key = None
+            mock_settings.lm_studio_api_key = None
+            mock_settings.dashscope_api_key = None
+            mock_settings.model_timeout_seconds = 120
+
+            mock_exec.return_value = mock_process
+            await cli_executor.execute(
+                canonical_name="my-custom-cli",
+                model_config=config,
+                messages=[{"role": "user", "content": "test"}],
+            )
+
+            call_env = mock_exec.call_args[1]["env"]
+            # Custom CLI without explicit cli_env opt-in → NO provider keys at all
+            assert "ANTHROPIC_API_KEY" not in call_env
+            assert "OPENAI_API_KEY" not in call_env
+
+    @pytest.mark.asyncio
+    async def test_execute_custom_cli_cli_env_explicit_opt_in_still_works(self, cli_executor):
+        """Custom CLI can request keys explicitly via cli_env (escape hatch).
+
+        The ${ANTHROPIC_API_KEY} expansion must resolve from Settings, even
+        though the executor stripped it from the inherited env first.
+        """
+        config = ModelConfig(
+            provider="cli",
+            cli_command="my-custom-claude-wrapper",  # NOT on allowlist
+            cli_args=[],
+            cli_parser="text",
+            cli_env={"ANTHROPIC_API_KEY": "${ANTHROPIC_API_KEY}"},  # explicit opt-in
+        )
+
+        mock_process = MagicMock()
+        mock_process.returncode = 0
+        mock_process.communicate = AsyncMock(return_value=(b"ok", b""))
+
+        with (
+            patch("shutil.which", return_value="/usr/bin/my-custom-claude-wrapper"),
+            patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
+            patch("multi_mcp.models.cli_executor.settings") as mock_settings,
+            patch("multi_mcp.models.cli_executor.log_llm_interaction"),
+            patch.dict("os.environ", {"PATH": "/usr/bin"}, clear=True),
+        ):
+            mock_settings.anthropic_api_key = "user-anthropic-key"
+            mock_settings.openai_api_key = None
+            mock_settings.gemini_api_key = None
+            mock_settings.openrouter_api_key = None
+            mock_settings.ollama_api_key = None
+            mock_settings.lm_studio_api_key = None
+            mock_settings.dashscope_api_key = None
+            mock_settings.model_timeout_seconds = 120
+
+            mock_exec.return_value = mock_process
+            await cli_executor.execute(
+                canonical_name="my-custom-claude-wrapper",
+                model_config=config,
+                messages=[{"role": "user", "content": "test"}],
+            )
+
+            call_env = mock_exec.call_args[1]["env"]
+            # The explicit opt-in via cli_env brings the key in, expanded from Settings.
+            assert call_env.get("ANTHROPIC_API_KEY") == "user-anthropic-key"
 
     @pytest.mark.asyncio
     async def test_execute_qwen_keys_only_forwarded_to_qwen(self, cli_executor):
