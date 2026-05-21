@@ -938,6 +938,25 @@ class TestExtractContentFromChatCompletion:
         response = {"choices": [{"message": {"content": 42}}]}
         assert _extract_content_from_chat_completion(response) == ""
 
+    def test_handles_none_text_in_list_parts_defensively(self):
+        """`{"text": null}` part used to crash "".join() — defensive `or ""` fix."""
+        from multi_mcp.models.litellm_client import _extract_content_from_chat_completion
+
+        response = {
+            "choices": [
+                {
+                    "message": {
+                        "content": [
+                            {"type": "text", "text": None},
+                            {"type": "text", "text": "after null"},
+                        ]
+                    }
+                }
+            ]
+        }
+        # Should not raise TypeError; null part contributes empty string
+        assert _extract_content_from_chat_completion(response) == "after null"
+
 
 class TestExtractContentFromResponsesApi:
     """Tests for the Responses API content extractor (used by OpenAI, Azure, Anthropic, Gemini).
@@ -1004,6 +1023,20 @@ class TestExtractContentFromResponsesApi:
 
         response = {"output": [{"type": "message", "content": "plain string"}]}
         assert _extract_content_from_responses_api(response) == "plain string"
+
+    def test_handles_none_text_in_list_parts_defensively(self):
+        """Defensive: `{"text": null}` in content list doesn't crash "".join()."""
+        from multi_mcp.models.litellm_client import _extract_content_from_responses_api
+
+        response = {
+            "output": [
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": None}, {"type": "output_text", "text": "after"}],
+                }
+            ]
+        }
+        assert _extract_content_from_responses_api(response) == "after"
 
 
 class TestEmptyContentAndErrorHandling:

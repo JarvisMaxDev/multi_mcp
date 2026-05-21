@@ -170,13 +170,14 @@ class CLIExecutor:
                 # humanize_error pattern-matches known CLI failures (e.g. codex "trusted dir",
                 # missing CLI on PATH, auth errors) and returns an actionable message.
                 # Falls through to the raw error preview + install hint when nothing matches.
+                # We detect a pattern match by looking for the humanizer's marker string
+                # "(Original error:" — equality check would fail on truncation/sanitization/empty input.
                 humanized = humanize_error(error_preview or "", canonical_name=canonical_name)
-                # If humanize returned the input unchanged, no pattern matched — keep the
-                # original informative format with stderr preview and install hint.
-                if humanized == error_preview:
+                pattern_matched = "(Original error:" in humanized
+                if not pattern_matched:
                     error_msg = (
                         f"CLI '{cli_command}' failed with exit code {process.returncode}. "
-                        f"Error: {error_preview}\n\n"
+                        f"Error: {error_preview or '(no output)'}\n\n"
                         f"Troubleshooting: {install_hint}"
                     )
                 else:
@@ -190,6 +191,20 @@ class CLIExecutor:
             # Parse output
             stdout = stdout_bytes.decode("utf-8", errors="replace")
             content = self._parse_output(stdout, model_config.cli_parser)
+
+            # Treat empty/whitespace-only content as an error — parity with LiteLLMClient.
+            # CLI tools that exit 0 but produce no useful output (filtered JSONL, empty
+            # stdout, etc.) should not silently succeed with blank content, because
+            # downstream consumers (codereview/debate) cannot distinguish "successful
+            # empty answer" from "model failed to respond".
+            if not content.strip():
+                error_msg = f"CLI '{cli_command}' returned empty output"
+                logger.error(f"[CLI_CALL] {error_msg}")
+                return ModelResponse.error_response(
+                    error=error_msg,
+                    model=canonical_name,
+                    latency_ms=latency_ms,
+                )
 
             metadata = ModelResponseMetadata(
                 model=canonical_name,
@@ -254,8 +269,10 @@ class CLIExecutor:
             # it just reported a model-side error — so surface that cleanly.
             latency_ms = int((time.perf_counter() - start_time) * 1000)
             logger.error(f"[CLI_CALL] {canonical_name} returned application error: {e}")
+            # Sanitize the error message — application errors may embed tokens
+            # (e.g. a CLI echoing back the request that included a key).
             response = ModelResponse.error_response(
-                error=str(e),
+                error=humanize_error(str(e), canonical_name=canonical_name),
                 model=canonical_name,
                 latency_ms=latency_ms,
             )
@@ -289,8 +306,11 @@ class CLIExecutor:
 
             logger.error(f"[CLI_CALL] {canonical_name} failed with exception: {type(e).__name__}: {e}")
             logger.debug("[CLI_CALL] Full error details", exc_info=True)
+            # Sanitize through humanize_error so any embedded secrets get redacted
+            # and known failure patterns produce actionable messages.
+            safe_error = humanize_error(f"{type(e).__name__}: {e!s}", canonical_name=canonical_name)
             return ModelResponse.error_response(
-                error=f"CLI execution failed: {type(e).__name__}: {e!s}",
+                error=f"CLI execution failed: {safe_error}",
                 model=canonical_name,
                 latency_ms=latency_ms,
             )

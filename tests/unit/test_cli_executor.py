@@ -187,6 +187,159 @@ class TestCLIExecutor:
             cli_executor._parse_output(stdout, "json")
 
     @pytest.mark.asyncio
+    async def test_execute_returns_error_on_empty_cli_output(self, cli_executor, cli_model_config):
+        """CLI that exits 0 with empty stdout must produce status:error, not silent success.
+
+        Parity with LiteLLMClient: downstream consumers (codereview/debate) cannot
+        distinguish between "model returned successful empty answer" and "model failed
+        but exited 0", so we surface this as an error.
+        """
+        mock_process = MagicMock()
+        mock_process.returncode = 0
+        mock_process.communicate = AsyncMock(return_value=(b"", b""))  # empty stdout AND stderr
+
+        with (
+            patch("shutil.which", return_value="/usr/bin/gemini"),
+            patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
+            patch("multi_mcp.models.cli_executor.log_llm_interaction"),
+        ):
+            mock_exec.return_value = mock_process
+
+            result = await cli_executor.execute(
+                canonical_name="gemini-cli",
+                model_config=cli_model_config,
+                messages=[{"role": "user", "content": "test"}],
+            )
+
+            assert result.status == "error"
+            assert "empty output" in result.error
+
+    @pytest.mark.asyncio
+    async def test_execute_returns_error_on_whitespace_only_output(self, cli_executor, cli_model_config):
+        """Whitespace-only stdout also counts as empty (would break consumers expecting real text)."""
+        mock_process = MagicMock()
+        mock_process.returncode = 0
+        # JSON parser will fall back to text and return the whitespace
+        mock_process.communicate = AsyncMock(return_value=(b"  \n  \t  ", b""))
+
+        with (
+            patch("shutil.which", return_value="/usr/bin/gemini"),
+            patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
+            patch("multi_mcp.models.cli_executor.log_llm_interaction"),
+        ):
+            mock_exec.return_value = mock_process
+
+            result = await cli_executor.execute(
+                canonical_name="gemini-cli",
+                model_config=cli_model_config,
+                messages=[{"role": "user", "content": "test"}],
+            )
+
+            assert result.status == "error"
+            assert "empty output" in result.error
+
+    @pytest.mark.asyncio
+    async def test_execute_humanizes_codex_trusted_dir_error(self, cli_executor):
+        """When codex CLI reports the trusted-directory failure, the user must see actionable advice,
+        not just the raw stderr line. Verifies the humanize_error integration in the exit-code branch.
+        """
+        codex_config = ModelConfig(
+            provider="cli",
+            cli_command="codex",
+            cli_args=["exec"],
+            cli_parser="jsonl",
+            cli_env={},
+        )
+        mock_process = MagicMock()
+        mock_process.returncode = 1
+        mock_process.communicate = AsyncMock(
+            return_value=(b"", b"Error: Not inside a trusted directory and --skip-git-repo-check was not specified.\n")
+        )
+
+        with (
+            patch("shutil.which", return_value="/usr/bin/codex"),
+            patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
+            patch("multi_mcp.models.cli_executor.log_llm_interaction"),
+        ):
+            mock_exec.return_value = mock_process
+
+            result = await cli_executor.execute(
+                canonical_name="codex-cli",
+                model_config=codex_config,
+                messages=[{"role": "user", "content": "test"}],
+            )
+
+            assert result.status == "error"
+            # The humanized message should appear, not just the raw stderr
+            assert "Codex CLI refuses to run here" in result.error
+            assert "--skip-git-repo-check" in result.error
+
+    @pytest.mark.asyncio
+    async def test_execute_falls_back_to_install_hint_for_unknown_cli_failure(self, cli_executor, cli_model_config):
+        """For unrecognized failure modes (no pattern match), preserve the original
+        'failed with exit code N + Troubleshooting:' format with install hint.
+
+        This is the bug fixed in humanize_error fallback: previously the string-equality
+        check broke when sanitize() truncated the input or when input was empty.
+        """
+        mock_process = MagicMock()
+        mock_process.returncode = 137
+        mock_process.communicate = AsyncMock(return_value=(b"", b"Some unique error nobody has ever seen before"))
+
+        with (
+            patch("shutil.which", return_value="/usr/bin/gemini"),
+            patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
+            patch("multi_mcp.models.cli_executor.log_llm_interaction"),
+        ):
+            mock_exec.return_value = mock_process
+
+            result = await cli_executor.execute(
+                canonical_name="gemini-cli",
+                model_config=cli_model_config,
+                messages=[{"role": "user", "content": "test"}],
+            )
+
+            assert result.status == "error"
+            # Unrecognized error → keep the rich exit-code format
+            assert "failed with exit code 137" in result.error
+            assert "Troubleshooting:" in result.error
+            assert "Some unique error nobody has ever seen before" in result.error
+
+    @pytest.mark.asyncio
+    async def test_execute_handles_empty_stderr_with_install_hint(self, cli_executor, cli_model_config):
+        """Empty stderr/stdout still produces a useful error with install hint, not a
+        placeholder. Was the regression caused by humanize_error("") returning the
+        "Unknown error" placeholder, which broke the previous equality-based fallback.
+        """
+        mock_process = MagicMock()
+        mock_process.returncode = 127
+        mock_process.communicate = AsyncMock(return_value=(b"", b""))  # both empty
+
+        # The empty-output guard fires BEFORE the exit-code branch can claim it.
+        # That's correct behavior — empty stdout with exit 0 OR exit nonzero both
+        # produce an error; here we verify that the exit-code branch handles the
+        # empty-stderr case cleanly when it does run (exit code nonzero, but no
+        # stderr to humanize).
+        with (
+            patch("shutil.which", return_value="/usr/bin/gemini"),
+            patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
+            patch("multi_mcp.models.cli_executor.log_llm_interaction"),
+        ):
+            mock_exec.return_value = mock_process
+
+            result = await cli_executor.execute(
+                canonical_name="gemini-cli",
+                model_config=cli_model_config,
+                messages=[{"role": "user", "content": "test"}],
+            )
+
+            assert result.status == "error"
+            # Must surface exit code and install hint even with empty stderr
+            assert "failed with exit code 127" in result.error
+            assert "Troubleshooting:" in result.error
+            assert "(no output)" in result.error  # fallback for empty stderr
+
+    @pytest.mark.asyncio
     async def test_execute_surfaces_claude_application_error_cleanly(self, cli_executor, cli_model_config):
         """When Claude CLI reports is_error=true, execute() must return a clean error
         response — not a misleading 'CLI execution failed: ValueError: ...' wrapper.

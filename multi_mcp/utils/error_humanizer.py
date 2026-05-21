@@ -59,7 +59,14 @@ _HUMANIZE_RULES: Final[tuple[_AuthRule, ...]] = (
     ),
     # --- Claude Code CLI ---
     (
-        re.compile(r"(invalid api key|api[_ ]?key.*not.*found|authentication[_ ]?error|401)", re.IGNORECASE),
+        re.compile(
+            # Tightened from a bare `401` (which matched any string with "401" — port
+            # numbers, request IDs, etc.) to require auth context: 401 followed by
+            # Unauthorized/Authentication, or explicit auth-error wording.
+            r"(invalid api key|api[_ ]?key.*not.*found|authentication[_ ]?error|"
+            r"\b401\s+(unauthorized|authentication)|unauthorized.*401)",
+            re.IGNORECASE,
+        ),
         (
             "Authentication failed. For CLI tools (claude/codex/gemini): run the tool's login command "
             "(e.g. `claude login`, `codex auth login`, `gemini auth login`). "

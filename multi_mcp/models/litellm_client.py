@@ -48,9 +48,11 @@ def _extract_content_from_responses_api(response) -> str:
                 logger.debug("[RESPONSE_PARSE] Message item has None content, skipping")
                 continue
 
-            # Handle content as list of text items
+            # Handle content as list of text items.
+            # Use `or ""` to coerce both missing-key and None-value cases — dict.get("text", "")
+            # returns None when the key exists with a None value, which would crash "".join().
             if isinstance(content, list):
-                return "".join(c.get("text", "") if isinstance(c, dict) else getattr(c, "text", "") for c in content if c)
+                return "".join((c.get("text") or "") if isinstance(c, dict) else (getattr(c, "text", "") or "") for c in content if c)
             # Handle content as string (fallback)
             elif isinstance(content, str):
                 return content
@@ -89,9 +91,10 @@ def _extract_content_from_chat_completion(response) -> str:
         return ""
     if isinstance(content, str):
         return content
-    # Some providers return structured content as a list of parts (e.g. [{"type": "text", "text": "..."}])
+    # Some providers return structured content as a list of parts (e.g. [{"type": "text", "text": "..."}]).
+    # `or ""` defends against `{"text": null}` which would otherwise pass None into "".join() and crash.
     if isinstance(content, list):
-        return "".join(c.get("text", "") if isinstance(c, dict) else getattr(c, "text", "") for c in content if c)
+        return "".join((c.get("text") or "") if isinstance(c, dict) else (getattr(c, "text", "") or "") for c in content if c)
     logger.debug(f"[RESPONSE_PARSE] Unexpected chat completion content type '{type(content).__name__}'")
     return ""
 
@@ -264,8 +267,9 @@ class LiteLLMClient:
             )
 
             # Enable provider-native web search if requested and supported.
-            # Only Responses API providers (OpenAI, Gemini) support the unified web_search tool;
-            # Ollama and other chat-completion providers don't have this concept.
+            # Only Responses-API providers (OpenAI, Azure, Anthropic, Gemini) support the unified
+            # web_search tool; Chat-Completions providers (Ollama, etc.) don't have this concept.
+            # Final gate is model_config.has_provider_web_search() — per-model opt-in via YAML.
             if not use_chat_completion and enable_web_search and model_config.has_provider_web_search():
                 kwargs["tools"] = [{"type": "web_search"}]
                 logger.info(f"[WEB_SEARCH] Enabled for model: {canonical_name}")
