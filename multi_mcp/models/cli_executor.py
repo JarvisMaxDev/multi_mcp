@@ -141,6 +141,15 @@ class CLIExecutor:
             settings_secrets["AWS_SECRET_ACCESS_KEY"] = settings.aws_secret_access_key
         if settings.aws_region_name:
             settings_secrets["AWS_REGION_NAME"] = settings.aws_region_name
+        # AWS_SESSION_TOKEN / AWS_SECURITY_TOKEN are typically set by AWS CLI
+        # `assume-role` flows in the parent shell — there are no Settings fields
+        # for them. Snapshot them from os.environ BEFORE we strip them from the
+        # subprocess env above, so `cli_env: {AWS_SESSION_TOKEN: "${AWS_SESSION_TOKEN}"}`
+        # opt-in still expands to the real value for custom CLIs.
+        for sts_key in ("AWS_SESSION_TOKEN", "AWS_SECURITY_TOKEN"):
+            sts_value = os.environ.get(sts_key)
+            if sts_value:
+                settings_secrets[sts_key] = sts_value
 
         # Allowlist: which provider key(s) each first-party CLI legitimately needs.
         # Keep this list narrow — extending it without a real consumer use case
@@ -579,9 +588,12 @@ class CLIExecutor:
         # (Earlier versions returned json.dumps(events) here, which would slip
         # through the empty-content check as "successful" content equal to "[...]"
         # — meaningless to downstream consumers and indistinguishable from a real answer.)
+        # Sanitize the raw events dump — qwen event arrays can embed prompt fragments
+        # or assistant text that include provider keys / Bearer tokens echoed back.
+        raw_events = json.dumps(events, ensure_ascii=False)[:DEBUG_LOG_MAX_LENGTH]
         logger.warning(
             "[CLI_PARSE] Qwen event array had no usable result or assistant text; raw events: %s",
-            json.dumps(events, ensure_ascii=False)[:DEBUG_LOG_MAX_LENGTH],
+            sanitize_for_log(raw_events),
         )
         return ""
 

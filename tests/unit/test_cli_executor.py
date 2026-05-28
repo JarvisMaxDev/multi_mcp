@@ -741,6 +741,69 @@ class TestCLIExecutor:
             assert "AZURE_API_VERSION" not in call_env, f"AZURE_API_VERSION leaked: {call_env.get('AZURE_API_VERSION')!r}"
 
     @pytest.mark.asyncio
+    async def test_execute_aws_sts_opt_in_via_cli_env_works(self, cli_executor):
+        """Custom CLI can opt into AWS_SESSION_TOKEN via cli_env even though
+        the executor strips it from the inherited env.
+
+        STS tokens are typically set in the parent shell by `aws sts assume-role`
+        — there's no Settings field for them. The executor snapshots them from
+        os.environ BEFORE stripping so `${AWS_SESSION_TOKEN}` expansion still works.
+        """
+        config = ModelConfig(
+            provider="cli",
+            cli_command="my-aws-cli",  # custom CLI, not on allowlist
+            cli_args=[],
+            cli_parser="text",
+            cli_env={"AWS_SESSION_TOKEN": "${AWS_SESSION_TOKEN}"},  # explicit opt-in
+        )
+        mock_process = MagicMock()
+        mock_process.returncode = 0
+        mock_process.communicate = AsyncMock(return_value=(b"ok", b""))
+
+        with (
+            patch("shutil.which", return_value="/usr/bin/my-aws-cli"),
+            patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
+            patch("multi_mcp.models.cli_executor.settings") as mock_settings,
+            patch("multi_mcp.models.cli_executor.log_llm_interaction"),
+            patch.dict(
+                "os.environ",
+                {
+                    "PATH": "/usr/bin",
+                    # STS session token in parent env (e.g. from aws sts assume-role)
+                    "AWS_SESSION_TOKEN": "FQoDYXdzE...real-session-token-value...",  # nosec
+                },
+                clear=True,
+            ),
+        ):
+            mock_settings.anthropic_api_key = None
+            mock_settings.openai_api_key = None
+            mock_settings.gemini_api_key = None
+            mock_settings.openrouter_api_key = None
+            mock_settings.ollama_api_key = None
+            mock_settings.lm_studio_api_key = None
+            mock_settings.dashscope_api_key = None
+            mock_settings.azure_api_key = None
+            mock_settings.azure_api_base = None
+            mock_settings.azure_api_version = None
+            mock_settings.aws_access_key_id = None
+            mock_settings.aws_secret_access_key = None
+            mock_settings.aws_region_name = None
+            mock_settings.model_timeout_seconds = 120
+
+            mock_exec.return_value = mock_process
+            await cli_executor.execute(
+                canonical_name="my-aws-cli",
+                model_config=config,
+                messages=[{"role": "user", "content": "test"}],
+            )
+
+            call_env = mock_exec.call_args[1]["env"]
+            # The opt-in via cli_env brings the token in, expanded from the parent-env snapshot.
+            # Without the snapshot, ${AWS_SESSION_TOKEN} would resolve to the literal placeholder
+            # because the executor stripped AWS_SESSION_TOKEN from env before expansion.
+            assert call_env.get("AWS_SESSION_TOKEN") == "FQoDYXdzE...real-session-token-value..."
+
+    @pytest.mark.asyncio
     async def test_execute_strips_azure_and_aws_credentials(self, cli_executor):
         """Azure and AWS credentials (API-only providers with no CLI consumer) must be
         stripped from every CLI subprocess. They are written to os.environ by
@@ -1242,6 +1305,30 @@ class TestCLIExecutor:
         stdout = '[{"type":"system","subtype":"session_start"},{"type":"tool_call","name":"foo"}]'
         result = cli_executor._parse_output(stdout, "qwen-json")
         assert result == ""
+
+    def test_parse_output_qwen_warning_log_sanitizes_event_secrets(self, cli_executor, caplog):
+        """Regression: the Qwen empty-fallback warning log must redact secrets in raw events.
+
+        A qwen event payload may echo back prompt fragments or assistant text containing
+        provider keys (e.g. a debug-mode CLI dumping its own config). Without sanitization,
+        those secrets persist to server logs.
+        """
+        import logging
+
+        fake_secret = "sk-FAKE-IN-QWEN-EVENT-1234567890abcdef"  # nosec
+        # An event array with no usable result/assistant text, but containing a secret-shaped value
+        stdout = f'[{{"type":"system","subtype":"session_start","echoed_prompt":"key={fake_secret}"}}]'
+
+        with caplog.at_level(logging.WARNING, logger="multi_mcp.models.cli_executor"):
+            result = cli_executor._parse_output(stdout, "qwen-json")
+
+        assert result == ""
+        # The warning must be present
+        warnings = [r for r in caplog.records if "Qwen event array" in r.getMessage()]
+        assert len(warnings) >= 1, f"Expected qwen warning in caplog, got: {[r.getMessage() for r in caplog.records]}"
+        # And the secret must NOT appear in any log record (it should be [REDACTED])
+        for record in caplog.records:
+            assert fake_secret not in record.getMessage(), f"Secret leaked into log: {record.getMessage()}"
 
     def test_parse_output_json_array_not_treated_as_qwen(self, cli_executor):
         """REGRESSION: `cli_parser: json` (generic) with a JSON array must NOT trigger qwen
