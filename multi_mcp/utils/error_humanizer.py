@@ -41,8 +41,64 @@ _SECRET_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
 )
 
 
+def _get_runtime_secret_values() -> tuple[str, ...]:
+    """Return all live secret values that should be redacted by exact-match string replace.
+
+    The regex patterns in _SECRET_PATTERNS catch secrets by SHAPE (sk-*, Bearer, AIza, AKIA/ASIA)
+    or by ASSIGNMENT FORM (KEY=value). But AWS secret access keys (40 base64 chars) and AWS STS
+    session tokens (long base64) have no recognizable prefix — if a CLI echoes just the bare
+    value, the regex layer misses it. This function returns the live configured values from
+    Settings + os.environ so _sanitize can do an exact string replace as a defense-in-depth
+    second pass. Empty/short values are filtered (avoids false-positive redactions on common words).
+
+    Lazy import of Settings to avoid circular import (settings.py is loaded by every consumer
+    of this module). Falls back gracefully if Settings can't be resolved.
+    """
+    import os
+
+    values: list[str | None] = [
+        # STS tokens — typically inherited from parent shell, not in Settings
+        os.environ.get("AWS_SESSION_TOKEN"),
+        os.environ.get("AWS_SECURITY_TOKEN"),
+    ]
+
+    try:
+        from multi_mcp.settings import settings
+
+        # Include ALL configured provider secrets — even those covered by regex patterns,
+        # because a CLI could echo a partial slice or unusual format that misses the regex.
+        values.extend(
+            [
+                settings.anthropic_api_key,
+                settings.openai_api_key,
+                settings.gemini_api_key,
+                settings.openrouter_api_key,
+                settings.ollama_api_key,
+                settings.lm_studio_api_key,
+                settings.dashscope_api_key,
+                settings.azure_api_key,
+                settings.aws_access_key_id,
+                settings.aws_secret_access_key,
+            ]
+        )
+    except Exception:
+        # Settings unreachable (test isolation, import-time failure, etc.) — regex layer still applies.
+        pass
+
+    # Require min length 12 to avoid replacing common substrings; deduplicate via dict.
+    return tuple({v: None for v in values if v and len(v) >= 12}.keys())
+
+
 def _sanitize(error: str) -> str:
-    """Remove credentials and cap length so we never leak secrets into error messages."""
+    """Remove credentials and cap length so we never leak secrets into error messages.
+
+    Two-pass redaction:
+    1. Exact-match replace of any live configured secret value (covers bare unprefixed values
+       like AWS secret keys / STS tokens which the regex layer can't catch by shape)
+    2. Regex pattern replace (covers structured forms: sk-*, Bearer, AIza, AKIA/ASIA, env-assigns)
+    """
+    for secret_value in _get_runtime_secret_values():
+        error = error.replace(secret_value, "[REDACTED]")
     for pattern in _SECRET_PATTERNS:
         error = pattern.sub("[REDACTED]", error)
     if len(error) > _MAX_ERROR_LENGTH:
