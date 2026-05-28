@@ -12,7 +12,27 @@ pass through unchanged so we don't accidentally mask new failure modes.
 """
 
 import re
+from functools import lru_cache
 from typing import Final
+
+# All credential env vars we know about — read from os.environ in addition to Settings
+# so the value-based redaction layer catches secrets injected after Settings init or
+# directly via shell rc files that bypass Pydantic Settings.
+_RUNTIME_SECRET_ENV_VARS: Final[tuple[str, ...]] = (
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "GEMINI_API_KEY",
+    "OPENROUTER_API_KEY",
+    "OLLAMA_API_KEY",
+    "LM_STUDIO_API_KEY",
+    "DASHSCOPE_API_KEY",
+    "AZURE_API_KEY",
+    "AZURE_API_BASE",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_SECURITY_TOKEN",
+)
 
 # Sanitization: cap message length and strip common secret patterns before surfacing.
 # These never need to leak to the AI assistant caller.
@@ -41,6 +61,7 @@ _SECRET_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
 )
 
 
+@lru_cache(maxsize=1)
 def _get_runtime_secret_values() -> tuple[str, ...]:
     """Return all live secret values that should be redacted by exact-match string replace.
 
@@ -51,16 +72,22 @@ def _get_runtime_secret_values() -> tuple[str, ...]:
     Settings + os.environ so _sanitize can do an exact string replace as a defense-in-depth
     second pass. Empty/short values are filtered (avoids false-positive redactions on common words).
 
+    Reads BOTH os.environ (catches shell-injected values, post-Settings-init mutations) and
+    Settings (canonical source for Pydantic-managed credentials). Returns values sorted
+    longest-first so a shorter secret that is a substring of another can't shred the longer
+    match before it gets a chance to replace.
+
+    Cached via @lru_cache(maxsize=1) — Settings is process-lifetime immutable, so a single
+    snapshot is correct. Tests that need to mutate Settings/env must call
+    _get_runtime_secret_values.cache_clear() in setup.
+
     Lazy import of Settings to avoid circular import (settings.py is loaded by every consumer
-    of this module). Falls back gracefully if Settings can't be resolved.
+    of this module). Narrow ImportError catch — real Settings validation errors should surface.
     """
     import os
 
-    values: list[str | None] = [
-        # STS tokens — typically inherited from parent shell, not in Settings
-        os.environ.get("AWS_SESSION_TOKEN"),
-        os.environ.get("AWS_SECURITY_TOKEN"),
-    ]
+    # Read all known credential env vars from os.environ first (broader coverage than just STS).
+    values: list[str | None] = [os.environ.get(key) for key in _RUNTIME_SECRET_ENV_VARS]
 
     try:
         from multi_mcp.settings import settings
@@ -81,12 +108,18 @@ def _get_runtime_secret_values() -> tuple[str, ...]:
                 settings.aws_secret_access_key,
             ]
         )
-    except Exception:
-        # Settings unreachable (test isolation, import-time failure, etc.) — regex layer still applies.
+    except ImportError:
+        # Settings module unreachable (e.g. during partial test import) — regex layer still applies.
+        # Narrow catch: real Settings validation errors (Pydantic ValidationError, AttributeError
+        # from renamed fields, etc.) should surface as bugs, not be silently swallowed.
         pass
 
-    # Require min length 12 to avoid replacing common substrings; deduplicate via dict.
-    return tuple({v: None for v in values if v and len(v) >= 12}.keys())
+    # Filter: drop None/empty + values too short to be credentials (avoids redacting common words).
+    # Dedupe via dict to preserve insertion order (but final sort discards order anyway).
+    # Sort longest-first: prevents a shorter secret that's a substring of a longer one from
+    # shredding the longer match (e.g. rotated keys sharing a prefix → partial leakage).
+    unique = {v: None for v in values if v and len(v) >= 12}.keys()
+    return tuple(sorted(unique, key=len, reverse=True))
 
 
 def _sanitize(error: str) -> str:
@@ -94,7 +127,9 @@ def _sanitize(error: str) -> str:
 
     Two-pass redaction:
     1. Exact-match replace of any live configured secret value (covers bare unprefixed values
-       like AWS secret keys / STS tokens which the regex layer can't catch by shape)
+       like AWS secret keys / STS tokens which the regex layer can't catch by shape).
+       Values are pre-sorted longest-first by _get_runtime_secret_values to prevent
+       substring overlap from leaving partial leakage.
     2. Regex pattern replace (covers structured forms: sk-*, Bearer, AIza, AKIA/ASIA, env-assigns)
     """
     for secret_value in _get_runtime_secret_values():
@@ -145,9 +180,10 @@ _HUMANIZE_RULES: Final[tuple[_AuthRule, ...]] = (
         re.compile(
             # Tightened from a bare `401` (which matched any string with "401" — port
             # numbers, request IDs, etc.) to require auth context: 401 followed by
-            # Unauthorized/Authentication, or explicit auth-error wording.
+            # Unauthorized/Authentication (with whitespace OR colon separator like
+            # "401: Unauthorized"), or explicit auth-error wording.
             r"(invalid api key|api[_ ]?key.*not.*found|authentication[_ ]?error|"
-            r"\b401\s+(unauthorized|authentication)|unauthorized.*401)",
+            r"\b401[\s:]+(unauthorized|authentication)|unauthorized.*401)",
             re.IGNORECASE,
         ),
         (

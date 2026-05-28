@@ -192,6 +192,9 @@ class LiteLLMClient:
             Model should already be resolved by the caller.
             CLI models should be routed through CLIExecutor.
         """
+        # Start time captured BEFORE the try block so exception handlers can compute
+        # latency_ms for observability (parity with cli_executor.py error paths).
+        start_time = time.perf_counter()
         try:
             # Reject CLI models - they should be routed elsewhere
             if model_config.is_cli_model():
@@ -280,7 +283,10 @@ class LiteLLMClient:
             # `raw_response` is the LiteLLM ModelResponse object; we keep it distinct from
             # our own `model_response` constructed below to avoid the shadowing trap where
             # log_llm_interaction would log the wrong shape if reordered.
-            start_time = time.perf_counter()
+            # Note: start_time is captured at method entry (before try) so exception handlers
+            # can compute latency_ms — re-capturing here would lose pre-API setup time
+            # (credential validation, kwargs building) from the success-path latency, which
+            # is a minor observability tradeoff we accept for parity with exception handlers.
             if use_chat_completion:
                 raw_response = await asyncio.wait_for(litellm.acompletion(**kwargs), timeout=timeout)
                 content = _extract_content_from_chat_completion(raw_response)
@@ -333,20 +339,25 @@ class LiteLLMClient:
         except (TimeoutError, litellm.Timeout):
             # litellm.Timeout fires from LiteLLM's internal HTTP layer; TimeoutError fires
             # from our asyncio.wait_for wrapper. Either way, surface a consistent timeout message.
+            # latency_ms tells operators how long the timeout actually took (parity with CLIExecutor).
+            latency_ms = int((time.perf_counter() - start_time) * 1000)
             logger.error(f"[MODEL_CALL] Model {canonical_name} timed out after {timeout}s")
             return ModelResponse.error_response(
                 error=f"Request timed out after {timeout}s",
                 model=canonical_name,
+                latency_ms=latency_ms,
             )
         except Exception as e:
             # logger.exception captures the full traceback — critical for diagnosing
             # non-trivial LiteLLM failures (auth errors, malformed responses, network glitches).
             # Sanitize the message portion to redact any API keys LiteLLM may have echoed
             # in the exception text. The traceback itself is logged separately by logger.exception.
+            latency_ms = int((time.perf_counter() - start_time) * 1000)
             logger.exception(f"[MODEL_CALL] Model {canonical_name} failed: {sanitize_for_log(str(e))}")
             # humanize_error sanitizes (strips API keys, caps length) and converts known
             # failure patterns (Ollama auth, missing models, etc.) into actionable messages.
             return ModelResponse.error_response(
                 error=humanize_error(str(e), canonical_name=canonical_name),
                 model=canonical_name,
+                latency_ms=latency_ms,
             )

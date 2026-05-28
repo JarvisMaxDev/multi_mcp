@@ -320,6 +320,69 @@ class TestCLIExecutor:
             assert "[REDACTED]" in command_str
 
     @pytest.mark.asyncio
+    async def test_execute_sanitizes_before_truncation(self, cli_executor, cli_model_config):
+        """Regression: a secret value MUST be redacted even if it crosses the truncation
+        boundary (ERROR_PREVIEW_MAX_LENGTH / DEBUG_LOG_MAX_LENGTH).
+
+        Previously: stderr was truncated FIRST, then passed to sanitize_for_log. If a bare
+        AWS_SECRET_ACCESS_KEY (40 chars, no recognizable prefix) crossed the cut, the
+        exact-string-match in the sanitizer couldn't find the full value and a partial
+        prefix would leak. Now: sanitize FIRST, truncate the redacted version.
+        """
+        from unittest.mock import patch as _patch
+
+        # Fake secret long enough that it crosses the 200-char truncation boundary
+        # when placed at the end of a >200-char string.
+        fake_secret = "test_fake_aws_secret_value_with_unique_suffix_12345"  # 51 chars, >=12 length filter
+        padding = "x" * 195  # 195 chars
+        stderr_with_secret_at_boundary = f"{padding}_{fake_secret}"  # 247 chars total; secret crosses 200-char cut
+
+        mock_process = MagicMock()
+        mock_process.returncode = 1
+        mock_process.communicate = AsyncMock(return_value=(b"", stderr_with_secret_at_boundary.encode()))
+
+        # Mock Settings to include the fake secret as a configured value so value-based
+        # redaction can find it.
+        mock_settings = MagicMock()
+        for attr in (
+            "anthropic_api_key",
+            "openai_api_key",
+            "gemini_api_key",
+            "openrouter_api_key",
+            "ollama_api_key",
+            "lm_studio_api_key",
+            "dashscope_api_key",
+            "azure_api_key",
+            "aws_access_key_id",
+        ):
+            setattr(mock_settings, attr, None)
+        mock_settings.aws_secret_access_key = fake_secret
+
+        with (
+            _patch("shutil.which", return_value="/usr/bin/gemini"),
+            _patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
+            _patch("multi_mcp.models.cli_executor.log_llm_interaction"),
+            _patch("multi_mcp.settings.settings", mock_settings),
+            # Clear lru_cache so our mocked settings actually reaches the sanitizer
+            _patch("multi_mcp.utils.error_humanizer._get_runtime_secret_values") as mock_get_secrets,
+        ):
+            mock_get_secrets.return_value = (fake_secret,)
+            mock_exec.return_value = mock_process
+
+            result = await cli_executor.execute(
+                canonical_name="gemini-cli",
+                model_config=cli_model_config,
+                messages=[{"role": "user", "content": "test"}],
+            )
+
+            assert result.status == "error"
+            # The full secret value must NOT appear anywhere in the user-visible error.
+            # The unique_suffix portion would only survive if sanitize-then-truncate was
+            # reversed (i.e. the old buggy order: truncate-then-sanitize).
+            assert "unique_suffix_12345" not in result.error, f"Secret tail leaked through truncation: {result.error}"
+            assert fake_secret not in result.error
+
+    @pytest.mark.asyncio
     async def test_execute_sanitizes_unknown_cli_failure_stderr(self, cli_executor, cli_model_config):
         """Regression test: when stderr contains an unknown failure pattern AND a secret,
         the secret must NOT appear in the user-visible error (only the install-hint

@@ -215,6 +215,33 @@ class TestLiteLLMClient:
             assert result.status == "error"
             assert "timed out" in result.error
             assert result.metadata.model == "gpt-5-mini"
+            # Regression: latency_ms must be set even on timeout (parity with CLIExecutor)
+            assert result.metadata.latency_ms >= 0
+
+    @pytest.mark.asyncio
+    async def test_call_async_error_handlers_include_latency_ms(self, client):
+        """Regression: TimeoutError and generic Exception handlers must populate latency_ms.
+
+        Previously they omitted latency_ms, creating an observability gap vs CLIExecutor
+        which always includes it in error responses.
+        """
+        with (
+            patch("multi_mcp.models.litellm_client.litellm.aresponses", new_callable=AsyncMock) as mock_completion,
+            patch("multi_mcp.models.litellm_client.log_llm_interaction"),
+            patch.object(client, "_validate_provider_credentials", return_value=None),
+        ):
+            # Test generic Exception path
+            mock_completion.side_effect = RuntimeError("simulated provider crash")
+
+            canonical_name, model_config = client.resolver.resolve("gpt-5-mini")
+            result = await client.execute(
+                canonical_name=canonical_name, model_config=model_config, messages=[{"role": "user", "content": "Hi"}]
+            )
+
+            assert result.status == "error"
+            # latency_ms is populated from the start_time captured before the try block
+            assert result.metadata.latency_ms is not None
+            assert result.metadata.latency_ms >= 0
 
     @pytest.mark.asyncio
     async def test_call_async_messages_parameter(self, client, mock_llm_response):

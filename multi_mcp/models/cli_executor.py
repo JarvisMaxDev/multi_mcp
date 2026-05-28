@@ -236,17 +236,21 @@ class CLIExecutor:
                 stderr = stderr_bytes.decode("utf-8", errors="replace")
                 stdout = stdout_bytes.decode("utf-8", errors="replace")
 
-                # Use stderr if available, otherwise use stdout (some CLIs write errors to stdout)
-                error_output = stderr if stderr else stdout
-                error_preview = error_output[:ERROR_PREVIEW_MAX_LENGTH] if error_output else "(no output)"
+                # CRITICAL ordering: sanitize BEFORE truncation. If a bare secret value
+                # (e.g. AWS_SECRET_ACCESS_KEY which has no recognizable prefix) crosses
+                # the truncation boundary, exact-string-replace in sanitize_for_log can't
+                # match the full value, and a partial prefix would leak. Sanitize the whole
+                # output first, then truncate the redacted version for logs/error preview.
+                safe_stderr = sanitize_for_log(stderr)
+                safe_stdout = sanitize_for_log(stdout)
+                safe_output = safe_stderr if safe_stderr else safe_stdout
+                error_preview = safe_output[:ERROR_PREVIEW_MAX_LENGTH] if safe_output else "(no output)"
 
                 install_hint = self.get_install_hint(cli_command)
                 logger.error(f"[CLI_CALL] {canonical_name} failed with exit code {process.returncode}")
-                # Sanitize raw stderr/stdout before logging — a CLI in debug mode might
-                # echo provider keys, Bearer tokens, or env-var assignments. logs/*.llm.json
-                # would otherwise persist secrets even though the caller gets a humanized error.
-                logger.debug(f"[CLI_CALL] stderr: {sanitize_for_log(stderr[:DEBUG_LOG_MAX_LENGTH])}")
-                logger.debug(f"[CLI_CALL] stdout: {sanitize_for_log(stdout[:DEBUG_LOG_MAX_LENGTH])}")
+                # Already-sanitized stderr/stdout — safe to truncate for debug logs.
+                logger.debug(f"[CLI_CALL] stderr: {safe_stderr[:DEBUG_LOG_MAX_LENGTH]}")
+                logger.debug(f"[CLI_CALL] stdout: {safe_stdout[:DEBUG_LOG_MAX_LENGTH]}")
                 # humanize_error pattern-matches known CLI failures (e.g. codex "trusted dir",
                 # missing CLI on PATH, auth errors) and returns an actionable message.
                 # Falls through to the raw error preview + install hint when nothing matches.

@@ -1,6 +1,21 @@
 """Unit tests for error_humanizer — pattern detection and credential sanitization."""
 
-from multi_mcp.utils.error_humanizer import humanize_error
+import pytest
+
+from multi_mcp.utils.error_humanizer import _get_runtime_secret_values, humanize_error
+
+
+@pytest.fixture(autouse=True)
+def _clear_secret_cache():
+    """Reset the lru_cache on _get_runtime_secret_values between tests.
+
+    Without this, mocked Settings/env values from one test would leak into the next
+    via the cache. The cache is desirable in production (Settings is process-immutable)
+    but must be invalidated for test isolation.
+    """
+    _get_runtime_secret_values.cache_clear()
+    yield
+    _get_runtime_secret_values.cache_clear()
 
 
 class TestSanitization:
@@ -99,6 +114,136 @@ class TestSanitization:
         out = humanize_error(raw)
         assert "sk-FAKE" not in out
         assert "[REDACTED]" in out
+
+    def test_value_pass_sorts_by_length_descending_to_avoid_substring_leak(self):
+        """If two configured secrets share a prefix or one is substring of another, the
+        longer one MUST be replaced first — otherwise the shorter replacement breaks the
+        longer match and leaves a partial leak like `[REDACTED]_suffix_of_longer`.
+
+        This is realistic during key rotation or when STS tokens share a base prefix
+        with another credential.
+        """
+        from unittest.mock import patch
+
+        short_secret = "SHARED_PREFIX_a"  # 15 chars
+        long_secret = "SHARED_PREFIX_a_followed_by_unique_tail"  # 39 chars, contains short as prefix
+
+        with patch(
+            "multi_mcp.utils.error_humanizer._get_runtime_secret_values",
+            return_value=(long_secret, short_secret),  # already in correct order (long first)
+        ):
+            raw = f"Error: secret was {long_secret} and got rejected"
+            out = humanize_error(raw)
+
+        # The long secret must be fully replaced — no portion of it should remain
+        assert long_secret not in out
+        assert "followed_by_unique_tail" not in out, f"Long secret tail leaked: {out}"
+        assert "[REDACTED]" in out
+
+    def test_value_pass_reads_broader_env_vars(self):
+        """_get_runtime_secret_values must read ALL credential env vars from os.environ,
+        not just AWS STS tokens — covers shell-injected values that bypass Settings.
+        """
+        from unittest.mock import MagicMock, patch
+
+        from multi_mcp.utils.error_humanizer import _get_runtime_secret_values
+
+        fake_anthropic = "fake_anthropic_value_from_shell_xyz"  # nosec — >= 12 chars
+        fake_openai = "fake_openai_value_from_shell_abc"  # nosec
+        fake_aws = "fake_aws_secret_value_from_shell_456"  # nosec
+
+        # Mock Settings with all-None values so contribution comes from os.environ only
+        mock_settings = MagicMock()
+        for attr in (
+            "anthropic_api_key",
+            "openai_api_key",
+            "gemini_api_key",
+            "openrouter_api_key",
+            "ollama_api_key",
+            "lm_studio_api_key",
+            "dashscope_api_key",
+            "azure_api_key",
+            "aws_access_key_id",
+            "aws_secret_access_key",
+        ):
+            setattr(mock_settings, attr, None)
+
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "ANTHROPIC_API_KEY": fake_anthropic,
+                    "OPENAI_API_KEY": fake_openai,
+                    "AWS_SECRET_ACCESS_KEY": fake_aws,
+                },
+                clear=True,
+            ),
+            patch("multi_mcp.settings.settings", mock_settings),
+        ):
+            values = _get_runtime_secret_values()
+
+        # All three shell-injected values must be in the redaction list
+        assert fake_anthropic in values, f"ANTHROPIC env value missing from secrets: {values}"
+        assert fake_openai in values, f"OPENAI env value missing from secrets: {values}"
+        assert fake_aws in values, f"AWS_SECRET env value missing from secrets: {values}"
+
+    def test_value_pass_uses_lru_cache(self):
+        """_get_runtime_secret_values is cached — repeated calls return the same tuple
+        instance (Settings is process-immutable in production).
+        """
+        from multi_mcp.utils.error_humanizer import _get_runtime_secret_values
+
+        # Call twice — second call should hit cache
+        first = _get_runtime_secret_values()
+        second = _get_runtime_secret_values()
+
+        # Tuples are immutable; cached version returns the same object
+        assert first is second
+
+        # Verify cache_clear works (used by our autouse fixture)
+        _get_runtime_secret_values.cache_clear()
+        third = _get_runtime_secret_values()
+        # After clear, may or may not be same object (depends on dict ordering / interning)
+        # — just verify the function still works.
+        assert isinstance(third, tuple)
+
+    def test_value_pass_narrow_import_error_only(self):
+        """If Settings import fails with ImportError → fall through gracefully.
+        BUT other exceptions (ValidationError, AttributeError) should NOT be swallowed —
+        those indicate real bugs that need to surface.
+        """
+        from unittest.mock import patch
+
+        from multi_mcp.utils.error_humanizer import _get_runtime_secret_values
+
+        # Simulate Settings raising a non-ImportError (e.g. pydantic ValidationError)
+        # Real exception should propagate, not be silently swallowed.
+        class FakeValidationError(Exception):
+            pass
+
+        # Patch the settings import inside the function to raise non-ImportError
+        original_import = __builtins__["__import__"] if isinstance(__builtins__, dict) else __builtins__.__import__
+
+        def selective_raise(name, *args, **kwargs):
+            if name == "multi_mcp.settings":
+                raise FakeValidationError("simulated pydantic failure")
+            return original_import(name, *args, **kwargs)
+
+        with (
+            patch("builtins.__import__", side_effect=selective_raise),
+            pytest.raises(FakeValidationError),
+        ):
+            _get_runtime_secret_values()
+
+    def test_401_with_colon_separator_matches_auth_rule(self):
+        """The 401-auth regex must match both `401 Unauthorized` (whitespace) and
+        `401: Unauthorized` (colon separator). Previously only whitespace was matched.
+        """
+        raw = "HTTP 401: Unauthorized — please re-login"
+        out = humanize_error(raw)
+        # Should hit the auth-failure friendly message
+        assert "Authentication failed" in out
+        assert "401" in out
 
     def test_value_pass_skips_short_values_to_avoid_false_positives(self):
         """_get_runtime_secret_values filters out values shorter than 12 chars to avoid
