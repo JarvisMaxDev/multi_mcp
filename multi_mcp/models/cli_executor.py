@@ -196,8 +196,12 @@ class CLIExecutor:
         # Use config timeout or fall back to settings
         timeout = settings.model_timeout_seconds
 
+        # Sanitize command for logs — if a user puts a secret-shaped value in cli_args
+        # (e.g. `--api-key=sk-...`), we don't want it persisted to logs/*.llm.json
+        # or debug output. cli_command itself is just the executable name (safe).
+        safe_command = [sanitize_for_log(arg) for arg in command]
         logger.info(f"[CLI_CALL] model={canonical_name} command={cli_command} parser={model_config.cli_parser}")
-        logger.debug(f"[CLI_CALL] full_command={' '.join(command)}")
+        logger.debug(f"[CLI_CALL] full_command={' '.join(safe_command)}")
 
         start_time = time.perf_counter()
         process: asyncio.subprocess.Process | None = None
@@ -297,7 +301,7 @@ class CLIExecutor:
                 request_data={
                     "model": canonical_name,
                     "cli": True,
-                    "command": command,
+                    "command": safe_command,  # sanitized version — see safe_command construction above
                     "prompt_length": len(prompt),
                 },
                 response_data=response.model_dump(),
@@ -357,7 +361,7 @@ class CLIExecutor:
                 request_data={
                     "model": canonical_name,
                     "cli": True,
-                    "command": command,
+                    "command": safe_command,  # sanitized version — see safe_command construction above
                     "prompt_length": len(prompt),
                 },
                 response_data=response.model_dump(),
@@ -569,10 +573,17 @@ class CLIExecutor:
                 if joined:
                     return joined
 
-        # Last resort: surface the whole array so the failure mode is visible
-        # in logs. Better than silently returning empty content.
-        logger.warning("[CLI_PARSE] Qwen event array had no usable result or assistant text")
-        return json.dumps(events, ensure_ascii=False)
+        # Last resort: return empty so the empty-content guard in execute()
+        # catches it and produces a proper error response. The raw events are
+        # still visible in server logs via the warning below for diagnosis.
+        # (Earlier versions returned json.dumps(events) here, which would slip
+        # through the empty-content check as "successful" content equal to "[...]"
+        # — meaningless to downstream consumers and indistinguishable from a real answer.)
+        logger.warning(
+            "[CLI_PARSE] Qwen event array had no usable result or assistant text; raw events: %s",
+            json.dumps(events, ensure_ascii=False)[:DEBUG_LOG_MAX_LENGTH],
+        )
+        return ""
 
     @staticmethod
     async def _terminate_subprocess(process: asyncio.subprocess.Process | None, reason: str) -> None:

@@ -67,6 +67,24 @@ class TestSanitization:
         assert fake_azure not in out
         assert "[REDACTED]" in out
 
+    def test_strips_aws_session_token_assignment(self):
+        """AWS_SESSION_TOKEN / AWS_SECURITY_TOKEN env-assignment forms must be redacted.
+
+        We strip these tokens from the CLI subprocess env, but a CLI/provider that
+        echoes the assignment in its error output would still leak it without this rule.
+        """
+        fake_token = "TEST_FAKE_SESSION_TOKEN_VALUE_xyz"  # nosec
+        raw = f"AWS error: AWS_SESSION_TOKEN={fake_token} expired"
+        out = humanize_error(raw)
+        assert fake_token not in out
+        assert "[REDACTED]" in out
+
+        # And the legacy AWS_SECURITY_TOKEN name
+        raw2 = f"AWS error: AWS_SECURITY_TOKEN='{fake_token}' expired"
+        out2 = humanize_error(raw2)
+        assert fake_token not in out2
+        assert "[REDACTED]" in out2
+
     def test_truncates_very_long_error(self):
         raw = "x" * 1000
         out = humanize_error(raw)

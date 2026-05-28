@@ -33,7 +33,8 @@ _SECRET_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
     # punctuation that typically delimits an assignment value.
     re.compile(
         r"['\"]?(?:OPENAI|ANTHROPIC|GEMINI|OPENROUTER|OLLAMA|LM_STUDIO|"
-        r"DASHSCOPE|AZURE|AWS_SECRET_ACCESS_KEY|AWS_ACCESS_KEY_ID)"
+        r"DASHSCOPE|AZURE|AWS_SECRET_ACCESS_KEY|AWS_ACCESS_KEY_ID|"
+        r"AWS_SESSION_TOKEN|AWS_SECURITY_TOKEN)"
         r"(?:_API_KEY|_API_BASE)?['\"]?\s*[:=]\s*['\"]?[^'\"\s,;}]+",
         re.IGNORECASE,
     ),

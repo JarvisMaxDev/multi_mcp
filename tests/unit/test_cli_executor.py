@@ -275,6 +275,51 @@ class TestCLIExecutor:
             assert "--skip-git-repo-check" in result.error
 
     @pytest.mark.asyncio
+    async def test_execute_sanitizes_cli_args_in_log_interaction(self, cli_executor):
+        """If a user puts a secret-shaped value in cli_args (e.g. `--api-key=sk-...`),
+        it must be sanitized before being passed to log_llm_interaction.
+
+        Defense-in-depth: our default configs use cli_env (which is also sanitized) for
+        credentials, but a custom config could legitimately put a token in cli_args.
+        """
+        fake_secret_in_args = "sk-FAKE-IN-ARGS-1234567890abcdef"  # nosec
+        config = ModelConfig(
+            provider="cli",
+            cli_command="claude",
+            cli_args=[f"--api-key={fake_secret_in_args}"],
+            cli_parser="json",
+            cli_env={},
+        )
+
+        mock_process = MagicMock()
+        mock_process.returncode = 0
+        mock_process.communicate = AsyncMock(return_value=(b'{"result":"ok","is_error":false}', b""))
+
+        captured_request_data = {}
+
+        def capture_log(**kwargs):
+            captured_request_data.update(kwargs.get("request_data", {}))
+
+        with (
+            patch("shutil.which", return_value="/usr/bin/claude"),
+            patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
+            patch("multi_mcp.models.cli_executor.log_llm_interaction", side_effect=capture_log),
+        ):
+            mock_exec.return_value = mock_process
+            await cli_executor.execute(
+                canonical_name="claude-cli",
+                model_config=config,
+                messages=[{"role": "user", "content": "test"}],
+            )
+
+            command = captured_request_data.get("command", [])
+            command_str = " ".join(command)
+            # The fake secret must not appear in the logged command
+            assert fake_secret_in_args not in command_str, f"Secret leaked in command log: {command_str}"
+            # Redaction marker should be present
+            assert "[REDACTED]" in command_str
+
+    @pytest.mark.asyncio
     async def test_execute_sanitizes_unknown_cli_failure_stderr(self, cli_executor, cli_model_config):
         """Regression test: when stderr contains an unknown failure pattern AND a secret,
         the secret must NOT appear in the user-visible error (only the install-hint
@@ -1187,15 +1232,16 @@ class TestCLIExecutor:
         assert reparsed == {"answer": 42, "ok": True}
 
     def test_parse_output_json_qwen_no_usable_content(self, cli_executor):
-        """No result event and no assistant text → re-serialize whole array for debug."""
+        """No result event and no assistant text → empty string so the empty-content guard
+        in execute() catches it and returns a proper error. Raw events still in logs.
+
+        Previously returned `json.dumps(events)` which slipped through the empty-content
+        guard as meaningless `[{...}]` content — failure was indistinguishable from a
+        real model response. Now returns "" so execute() rejects it cleanly.
+        """
         stdout = '[{"type":"system","subtype":"session_start"},{"type":"tool_call","name":"foo"}]'
         result = cli_executor._parse_output(stdout, "qwen-json")
-        assert isinstance(result, str)
-        import json as _json
-
-        reparsed = _json.loads(result)
-        assert isinstance(reparsed, list)
-        assert reparsed[0]["type"] == "system"
+        assert result == ""
 
     def test_parse_output_json_array_not_treated_as_qwen(self, cli_executor):
         """REGRESSION: `cli_parser: json` (generic) with a JSON array must NOT trigger qwen
