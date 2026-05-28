@@ -542,6 +542,33 @@ class TestCLIExecutor:
         result = cli_executor._parse_output(stdout, "jsonl")
         assert result == "Test response"
 
+    def test_parse_output_jsonl_non_dict_lines_skipped(self, cli_executor):
+        """Regression: a valid-JSON-but-non-dict JSONL line (bare string, number, array)
+        must be skipped, not crash with AttributeError.
+
+        Previously `event.get("type")` was called without an isinstance guard — a line
+        like `"just a string"` or `42` or `[1,2]` would raise AttributeError, which
+        `except json.JSONDecodeError` didn't catch, surfacing as a confusing
+        "CLI execution failed: AttributeError" instead of graceful skipping.
+        """
+        stdout = "\n".join(
+            [
+                '"just a bare string"',  # valid JSON, but a str
+                "42",  # valid JSON, but an int
+                "[1, 2, 3]",  # valid JSON, but a list
+                '{"type": "text", "text": "real content"}',  # the only usable line
+            ]
+        )
+        result = cli_executor._parse_output(stdout, "jsonl")
+        assert result == "real content"
+
+    def test_parse_output_jsonl_non_dict_item_skipped(self, cli_executor):
+        """Regression: item.completed event whose `item` field is a non-dict must not crash."""
+        stdout = '{"type": "item.completed", "item": "not-a-dict"}'
+        result = cli_executor._parse_output(stdout, "jsonl")
+        # No usable content → empty string (no crash)
+        assert result == ""
+
     def test_parse_output_jsonl_empty_lines(self, cli_executor):
         """Test JSONL parsing skips empty lines."""
         stdout = """{"type": "text", "text": "Hello"}
