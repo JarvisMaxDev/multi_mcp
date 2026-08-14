@@ -211,6 +211,48 @@ class TestCodeReviewRequest:
         assert request.relevant_files is None
         assert request.issues_found is None
 
+    def test_stringified_lists_are_normalized(self):
+        """JSON-encoded tool arguments should be restored before validation."""
+        request = CodeReviewRequest(
+            name="Test",
+            content="Test content",
+            step_number=2,
+            next_action="stop",
+            base_path="/tmp/test",
+            models='["claude", "codex"]',
+            relevant_files='["/tmp/test/a.py", "/tmp/test/b.py"]',
+            issues_found='[{"severity":"low","location":"a.py:1","description":"Test"}]',
+        )
+
+        assert request.models == ["claude", "codex"]
+        assert request.relevant_files == ["/tmp/test/a.py", "/tmp/test/b.py"]
+        assert request.issues_found == [{"severity": "low", "location": "a.py:1", "description": "Test"}]
+
+    def test_single_file_string_is_normalized(self):
+        """A single file path string should become a one-item list."""
+        request = CodeReviewRequest(
+            name="Test",
+            content="Test content",
+            step_number=2,
+            next_action="stop",
+            base_path="/tmp/test",
+            relevant_files="/tmp/test/a.py",
+        )
+
+        assert request.relevant_files == ["/tmp/test/a.py"]
+
+    def test_malformed_stringified_list_is_rejected(self):
+        """Malformed JSON that looks like a list must not bypass validation."""
+        with pytest.raises(ValidationError):
+            CodeReviewRequest(
+                name="Test",
+                content="Test content",
+                step_number=2,
+                next_action="stop",
+                base_path="/tmp/test",
+                relevant_files="[not valid json]",
+            )
+
 
 class TestCodeReviewResponse:
     """Tests for CodeReviewResponse model."""

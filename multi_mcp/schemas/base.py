@@ -1,10 +1,28 @@
 """Base schema models for all tools."""
 
-from typing import Literal
+import json
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, BeforeValidator, Field, field_validator
 
 from multi_mcp.settings import settings
+
+
+def coerce_stringified_list(value: object) -> object:
+    """Recover list arguments that a tool-calling model encoded as JSON text."""
+    if not isinstance(value, str):
+        return value
+
+    stripped = value.strip()
+    if stripped.startswith("[") and stripped.endswith("]"):
+        try:
+            return json.loads(stripped)
+        except json.JSONDecodeError:
+            return value
+
+    # A single string is unambiguous for list[str] fields such as file paths
+    # and model names. Other list item types will still fail Pydantic validation.
+    return [value]
 
 
 class ModelResponseMetadata(BaseModel):
@@ -74,7 +92,7 @@ class BaseToolRequest(BaseModel):
         ...,
         description="Absolute path to project root to id the project and load project files",
     )
-    relevant_files: list[str] | None = Field(
+    relevant_files: Annotated[list[str] | None, BeforeValidator(coerce_stringified_list)] = Field(
         default=None,
         description=(
             f"Absolute paths of ALL files relevant to this question (up to {settings.max_files_per_review} files). "
@@ -115,7 +133,7 @@ class SingleToolRequest(BaseToolRequest):
 class MultiToolRequest(BaseToolRequest):
     """Request for multi-model parallel execution (e.g., compare, codereview)."""
 
-    models: list[str] = Field(
+    models: Annotated[list[str], BeforeValidator(coerce_stringified_list)] = Field(
         default_factory=lambda: settings.default_model_list,
         min_length=1,
         description=f"List of LLM models to run in parallel (minimum 1) (will use default models ({settings.default_model_list}) if not specified)",

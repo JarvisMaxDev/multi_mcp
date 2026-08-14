@@ -1,15 +1,17 @@
 """Debate tool schema models."""
 
-from pydantic import Field
+from typing import Annotated
 
-from multi_mcp.schemas.base import ModelResponse, MultiToolRequest, MultiToolResponse
+from pydantic import BeforeValidator, Field
+
+from multi_mcp.schemas.base import ModelResponse, MultiToolRequest, MultiToolResponse, coerce_stringified_list
 from multi_mcp.settings import settings
 
 
 class DebateRequest(MultiToolRequest):
     """Debate request - runs models in two steps: independent answers + debate."""
 
-    models: list[str] = Field(
+    models: Annotated[list[str], BeforeValidator(coerce_stringified_list)] = Field(
         default_factory=lambda: settings.default_model_list,
         min_length=2,
         description=f"List of LLM models to run in parallel (minimum 2) (will use default models ({settings.default_model_list}) if not specified)",

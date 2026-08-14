@@ -7,6 +7,8 @@ These tests verify that:
 - No duplicate tool names
 """
 
+import json
+
 import pytest
 
 
@@ -100,6 +102,40 @@ class TestToolSchemas:
         assert "content" in fields, "CodeReviewRequest should have 'content' field"
         assert "step_number" in fields, "CodeReviewRequest should have 'step_number' field"
         assert "next_action" in fields, "CodeReviewRequest should have 'next_action' field"
+
+    def test_codereview_fastmcp_schema_keeps_array_types(self):
+        """Recovery validators must not advertise string inputs to models."""
+        from multi_mcp.server import codereview
+
+        properties = codereview.parameters["properties"]
+        for field_name in ("relevant_files", "models", "issues_found"):
+            schema = properties[field_name]
+            variants = schema.get("anyOf", [schema])
+            assert any(variant.get("type") == "array" for variant in variants)
+            assert all(variant.get("type") != "string" for variant in variants)
+
+    @pytest.mark.asyncio
+    async def test_codereview_accepts_stringified_array_arguments(self, monkeypatch):
+        """FastMCP should recover arrays stringified by native tool-use providers."""
+        monkeypatch.setattr("multi_mcp.utils.mcp_decorator.log_mcp_interaction", lambda **_kwargs: None)
+
+        from multi_mcp.server import codereview
+
+        result = await codereview.run(
+            {
+                "name": "Stringified array regression",
+                "content": "Verify tool argument normalization",
+                "step_number": 1,
+                "next_action": "continue",
+                "base_path": "/tmp",
+                "relevant_files": json.dumps(["/tmp/example.py"]),
+                "models": json.dumps(["glm5.2"]),
+                "issues_found": json.dumps([{"severity": "low", "location": "example.py:1", "description": "Test issue"}]),
+            }
+        )
+
+        assert result.structured_content["status"] == "in_progress"
+        assert result.structured_content["intent"] == "codereview"
 
     def test_chat_schema_valid(self):
         """Chat tool has valid schema."""

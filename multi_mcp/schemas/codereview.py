@@ -1,8 +1,10 @@
 """CodeReview schema models."""
 
-from pydantic import Field
+from typing import Annotated
 
-from multi_mcp.schemas.base import ModelResponse, MultiToolRequest, MultiToolResponse
+from pydantic import BeforeValidator, Field
+
+from multi_mcp.schemas.base import ModelResponse, MultiToolRequest, MultiToolResponse, coerce_stringified_list
 
 
 class CodeReviewRequest(MultiToolRequest):
@@ -18,7 +20,7 @@ class CodeReviewRequest(MultiToolRequest):
             "Exclude: code snippets (use `relevant_files`), issue lists (use `issues_found`)."
         ),
     )
-    issues_found: list[dict] | None = Field(
+    issues_found: Annotated[list[dict] | None, BeforeValidator(coerce_stringified_list)] = Field(
         default=None,
         description=(
             "REQUIRED: List of issues identified with severity levels, locations, and detailed descriptions. "

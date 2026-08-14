@@ -46,7 +46,9 @@ def create_mcp_wrapper(
     for field_name, field_info in schema_class.model_fields.items():
         description = get_field_description(schema_class, field_name)
 
-        annotated_type = Annotated[field_info.annotation, description]
+        # Preserve Pydantic metadata such as BeforeValidator so FastMCP applies
+        # the same boundary validation as the request model.
+        annotated_type = Annotated[field_info.annotation, *field_info.metadata, description]
 
         default = inspect.Parameter.empty if field_info.is_required() else None
 

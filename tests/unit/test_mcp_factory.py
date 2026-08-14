@@ -1,10 +1,11 @@
 """Unit tests for MCP factory pattern."""
 
 import inspect
-from typing import Literal, get_type_hints
+import json
+from typing import Annotated, Literal, get_type_hints
 
 import pytest
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, BeforeValidator, Field
 
 from multi_mcp.utils.mcp_factory import create_mcp_wrapper
 
@@ -532,6 +533,28 @@ class TestInspectSignatureImplementation:
         count_metadata = str(hints["count"].__metadata__)
         assert "Name description" in name_metadata
         assert "Count description" in count_metadata
+
+    def test_signature_preserves_pydantic_metadata(self):
+        """Wrapper should retain validators needed by FastMCP input parsing."""
+
+        def parse_json_list(value):
+            return json.loads(value) if isinstance(value, str) else value
+
+        class TestRequest(BaseModel):
+            values: Annotated[list[str], BeforeValidator(parse_json_list)] = Field(
+                default_factory=list,
+                description="Values description",
+            )
+
+        async def test_impl(values: list[str] | None = None):
+            return {"values": values}
+
+        wrapper = create_mcp_wrapper(TestRequest, test_impl)
+        hints = get_type_hints(wrapper, include_extras=True)
+
+        metadata = hints["values"].__metadata__
+        assert any(getattr(item, "func", None) is parse_json_list for item in metadata)
+        assert "Values description" in str(metadata)
 
     def test_required_params_have_parameter_empty(self):
         """Required fields should have Parameter.empty as default."""
