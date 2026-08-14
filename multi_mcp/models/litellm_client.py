@@ -6,6 +6,7 @@ import time
 from typing import Any
 
 import litellm
+from litellm.exceptions import Timeout as LiteLLMTimeout
 
 from multi_mcp.constants import DEFAULT_MAX_TOKENS
 from multi_mcp.models.config import PROVIDERS, ModelConfig
@@ -336,7 +337,7 @@ class LiteLLMClient:
             )
             return model_response
 
-        except (TimeoutError, litellm.Timeout):
+        except (TimeoutError, LiteLLMTimeout):
             # litellm.Timeout fires from LiteLLM's internal HTTP layer; TimeoutError fires
             # from our asyncio.wait_for wrapper. Either way, surface a consistent timeout message.
             # latency_ms tells operators how long the timeout actually took (parity with CLIExecutor).

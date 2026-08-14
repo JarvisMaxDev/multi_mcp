@@ -501,11 +501,15 @@ class CLIExecutor:
             # Parse JSONL (one JSON per line, extract text from events)
             lines = stdout.strip().split("\n")
             messages = []
+            parsed_event = False
             for line in lines:
                 if not line.strip():
                     continue
                 try:
                     event = json.loads(line)
+                    parsed_event = True
+                    if not isinstance(event, dict):
+                        continue
                     # Handle different event types
                     if event.get("type") == "text":
                         text = event.get("text", "")
@@ -514,13 +518,13 @@ class CLIExecutor:
                     elif event.get("type") == "item.completed":
                         # Codex format: extract text from item
                         item = event.get("item", {})
-                        if item.get("type") == "agent_message":
+                        if isinstance(item, dict) and item.get("type") == "agent_message":
                             text = item.get("text", "")
                             if text:
                                 messages.append(text)
                 except json.JSONDecodeError:
                     continue
-            return "\n".join(messages) if messages else stdout.strip()
+            return "\n".join(messages) if messages or parsed_event else stdout.strip()
 
         else:  # "text" or fallback
             return stdout.strip()
