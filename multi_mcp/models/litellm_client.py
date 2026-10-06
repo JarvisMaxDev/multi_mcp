@@ -100,6 +100,42 @@ def _extract_content_from_chat_completion(response) -> str:
     return ""
 
 
+def _extract_usage_counts(response) -> tuple[int, int]:
+    """Return (total_tokens, completion_tokens) from dict or object responses."""
+    usage = response.get("usage") if isinstance(response, dict) else getattr(response, "usage", None)
+    if not usage:
+        return 0, 0
+
+    if isinstance(usage, dict):
+        total = usage.get("total_tokens")
+        prompt = usage.get("prompt_tokens")
+        completion = usage.get("completion_tokens")
+    else:
+        total = getattr(usage, "total_tokens", None)
+        prompt = getattr(usage, "prompt_tokens", None)
+        completion = getattr(usage, "completion_tokens", None)
+
+    prompt_tokens = prompt if isinstance(prompt, int) else 0
+    completion_tokens = completion if isinstance(completion, int) else 0
+    total_tokens = total if isinstance(total, int) and total > 0 else prompt_tokens + completion_tokens
+    return total_tokens, completion_tokens
+
+
+def _extract_reasoning_from_chat_completion(response) -> str:
+    """Extract LiteLLM's normalized reasoning_content from a chat completion."""
+    choices = response.get("choices") if isinstance(response, dict) else getattr(response, "choices", None)
+    if not choices:
+        return ""
+
+    first = choices[0]
+    message = first.get("message") if isinstance(first, dict) else getattr(first, "message", None)
+    if message is None:
+        return ""
+
+    reasoning = message.get("reasoning_content") if isinstance(message, dict) else getattr(message, "reasoning_content", None)
+    return reasoning if isinstance(reasoning, str) else ""
+
+
 # Provider prefixes that must use Chat Completions API (litellm.acompletion).
 # LiteLLM's Responses API (litellm.aresponses) only routes for providers that natively
 # support it: OpenAI, Azure OpenAI, Anthropic, Gemini. Ollama (and others) only
@@ -296,29 +332,27 @@ class LiteLLMClient:
                 content = _extract_content_from_responses_api(raw_response)
             latency_ms = int((time.perf_counter() - start_time) * 1000)
 
+            # Extract usage before validating content so truncated reasoning-only
+            # responses can be distinguished from malformed empty responses.
+            total_tokens, completion_tokens = _extract_usage_counts(raw_response)
+
             # Treat empty content as an error rather than a silent success.
             # Both extractors return "" defensively for malformed responses (missing output/choices,
             # message item not found, etc.); without this guard, callers would receive
             # status="success" with no content and silently produce bad reviews/empty answers.
             if not content.strip():
-                error_msg = f"Model '{canonical_name}' returned empty content via {api_path}"
-                logger.error(f"[MODEL_CALL] {error_msg}")
-                return ModelResponse.error_response(error=error_msg, model=canonical_name)
+                reasoning_content = _extract_reasoning_from_chat_completion(raw_response) if use_chat_completion else ""
 
-            # Extract usage stats. Both APIs expose response.usage.total_tokens
-            # (chat completions also has prompt/completion split, but we only need the total).
-            # LiteLLM can return response as either an object or a raw dict depending on provider,
-            # so handle both shapes. Also fall back to prompt+completion sum when total isn't set,
-            # which some chat-completion providers do.
-            total_tokens = 0
-            usage = raw_response.get("usage") if isinstance(raw_response, dict) else getattr(raw_response, "usage", None)
-            if usage:
-                if isinstance(usage, dict):
-                    total_tokens = usage.get("total_tokens") or ((usage.get("prompt_tokens") or 0) + (usage.get("completion_tokens") or 0))
-                else:
-                    total_tokens = getattr(usage, "total_tokens", None) or (
-                        (getattr(usage, "prompt_tokens", 0) or 0) + (getattr(usage, "completion_tokens", 0) or 0)
+                if reasoning_content and completion_tokens >= max_output:
+                    error_msg = (
+                        f"Model '{canonical_name}' exhausted max_tokens={max_output} in reasoning without final content via {api_path}"
                     )
+                elif reasoning_content:
+                    error_msg = f"Model '{canonical_name}' returned reasoning but no final content via {api_path}"
+                else:
+                    error_msg = f"Model '{canonical_name}' returned empty content via {api_path}"
+                logger.error(f"[MODEL_CALL] {error_msg}")
+                return ModelResponse.error_response(error=error_msg, model=canonical_name, latency_ms=latency_ms)
 
             metadata = ModelResponseMetadata(
                 model=canonical_name,

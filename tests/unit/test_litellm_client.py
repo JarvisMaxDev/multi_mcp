@@ -1136,6 +1136,44 @@ class TestEmptyContentAndErrorHandling:
             assert "empty content" in result.error
 
     @pytest.mark.asyncio
+    async def test_reasoning_that_exhausts_output_budget_reports_truncation(self, client_for_ollama):
+        """A reasoning model can consume max_tokens before producing final content."""
+        truncated_response = {
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "message": {
+                        "content": "",
+                        "reasoning_content": "still reasoning",
+                    },
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 32768,
+                "total_tokens": 32868,
+            },
+        }
+
+        with (
+            patch("multi_mcp.models.litellm_client.litellm.acompletion", new_callable=AsyncMock) as mock_acompletion,
+            patch("multi_mcp.models.litellm_client.log_llm_interaction"),
+            patch.object(client_for_ollama, "_validate_provider_credentials", return_value=None),
+        ):
+            mock_acompletion.return_value = truncated_response
+
+            canonical_name, model_config = client_for_ollama.resolver.resolve("glm-5.1")
+            result = await client_for_ollama.execute(
+                canonical_name=canonical_name,
+                model_config=model_config,
+                messages=[{"role": "user", "content": "Hi"}],
+            )
+
+            assert result.status == "error"
+            assert result.error == ("Model 'ollama-glm' exhausted max_tokens=32768 in reasoning without final content via acompletion")
+            assert result.metadata.latency_ms >= 0
+
+    @pytest.mark.asyncio
     async def test_litellm_timeout_caught_separately(self, client_for_ollama):
         """litellm.Timeout (HTTP-layer) must produce the same clean timeout message as TimeoutError."""
         import litellm as litellm_module
