@@ -85,28 +85,64 @@ async def models() -> dict:
     return await models_impl()
 
 
+# Prompts are surfaced as slash commands; the host model only sees this text plus the user's
+# request, so it must be explicit enough that the host does not substitute its own work.
+EXTERNAL_MODELS_RULE = """The work must be done by the external models this server runs. Do not do it yourself, and do not spawn subagents, load skills or start other sessions as a substitute.
+Model names in the user's request refer to this server's `models` tool (names or aliases such as `claude`, `codex`, `gemini`), not to the host's own model list.
+If a requested model is missing or reports invalid credentials, stop and report it instead of substituting another model."""
+
+USER_REQUEST_NOTE = "Treat any text the user added after this command as their request."
+
+
 @mcp.prompt(name="codereview")
 async def codereview_prompt() -> str:
     """Perform systematic code review"""
-    return "Use the codereview tool to analyze code for quality, security, performance, and architecture issues."
+    return f"""Run a multi-model code review with this server's `codereview` tool.
+
+{EXTERNAL_MODELS_RULE}
+
+1. Call `codereview` with step_number=1 and no thread_id to start a new review; keep the returned thread_id.
+2. Call step_number=2 with that thread_id, the absolute `base_path`, absolute paths of the files under review in `relevant_files`, and the review scope and focus in `content`.
+3. Pass `models` only when the user names reviewers; otherwise omit it to use the configured defaults.
+4. Report the findings attributed to each model, and name any model that failed.
+
+{USER_REQUEST_NOTE}"""
 
 
 @mcp.prompt(name="chat")
 async def chat_prompt() -> str:
     """Chat with AI assistant"""
-    return "Use the chat tool for general conversation, questions, and assistance."
+    return f"""Ask an external model through this server's `chat` tool.
+
+{EXTERNAL_MODELS_RULE}
+
+Pass `model` only when the user names one; otherwise omit it to use the configured default. Relay the model's answer attributed to it.
+
+{USER_REQUEST_NOTE}"""
 
 
 @mcp.prompt(name="compare")
 async def compare_prompt() -> str:
     """Compare responses from multiple AI models"""
-    return "Use the compare tool to run the same query against multiple models in parallel."
+    return f"""Run the same request against several external models in parallel with this server's `compare` tool.
+
+{EXTERNAL_MODELS_RULE}
+
+Pass `models` only when the user names them; otherwise omit it to use the configured defaults. Present each model's answer attributed to it, then compare them.
+
+{USER_REQUEST_NOTE}"""
 
 
 @mcp.prompt(name="debate")
 async def debate_prompt() -> str:
     """Multi-model debate with critique and voting"""
-    return "Use the debate tool to run a two-step debate: models answer independently, then critique and vote on best response."
+    return f"""Run a multi-model debate with this server's `debate` tool: the models answer independently, then critique each other and vote.
+
+{EXTERNAL_MODELS_RULE}
+
+Pass `models` only when the user names them; otherwise omit it to use the configured defaults. Report each model's position and the vote attributed to the models.
+
+{USER_REQUEST_NOTE}"""
 
 
 @mcp.prompt(name="models")

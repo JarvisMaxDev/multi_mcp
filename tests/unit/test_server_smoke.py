@@ -233,3 +233,36 @@ class TestConfigurationLoading:
 
         assert len(CHAT_PROMPT) > 0, "Chat prompt should be loaded"
         assert len(CODEREVIEW_PROMPT) > 0, "Codereview prompt should be loaded"
+
+
+class TestMcpPrompts:
+    """Test MCP prompts exposed as slash commands."""
+
+    @pytest.mark.parametrize("name", ["codereview", "chat", "compare", "debate"])
+    async def test_prompt_forbids_host_substitution(self, name):
+        """Model-running prompts name their tool and forbid doing the work in the host."""
+        from fastmcp import Client
+
+        from multi_mcp.server import mcp
+
+        async with Client(mcp) as client:
+            result = await client.get_prompt(name)
+
+        text = result.messages[0].content.text
+        assert f"`{name}` tool" in text
+        assert "do not spawn subagents" in text
+        assert "not to the host's own model list" in text
+        assert "instead of substituting another model" in text
+
+    async def test_codereview_prompt_starts_new_thread(self):
+        """Codereview prompt starts a fresh thread and keeps default models unless named."""
+        from fastmcp import Client
+
+        from multi_mcp.server import mcp
+
+        async with Client(mcp) as client:
+            result = await client.get_prompt("codereview")
+
+        text = result.messages[0].content.text
+        assert "step_number=1 and no thread_id" in text
+        assert "Pass `models` only when the user names reviewers" in text
