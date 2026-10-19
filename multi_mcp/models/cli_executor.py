@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import time
+from pathlib import Path
 
 from multi_mcp.constants import DEBUG_LOG_MAX_LENGTH, ERROR_PREVIEW_MAX_LENGTH
 from multi_mcp.models.config import ModelConfig
@@ -199,6 +200,9 @@ class CLIExecutor:
         # multi-turn chat was effectively broken for CLI providers.
         prompt = self._format_messages_as_prompt(messages)
 
+        if model_config.cli_max_input_chars and len(prompt) > model_config.cli_max_input_chars:
+            return await self._execute_multi_turn(canonical_name, model_config, cli_command, prompt, env)
+
         # Build command
         command = [cli_command, *model_config.cli_args]
 
@@ -233,52 +237,7 @@ class CLIExecutor:
             latency_ms = int((time.perf_counter() - start_time) * 1000)
 
             if process.returncode != 0:
-                stderr = stderr_bytes.decode("utf-8", errors="replace")
-                stdout = stdout_bytes.decode("utf-8", errors="replace")
-
-                # CRITICAL ordering: sanitize BEFORE truncation. If a bare secret value
-                # (e.g. AWS_SECRET_ACCESS_KEY which has no recognizable prefix) crosses
-                # the truncation boundary, exact-string-replace in sanitize_for_log can't
-                # match the full value, and a partial prefix would leak. Sanitize the whole
-                # output first, then truncate the redacted version for logs/error preview.
-                safe_stderr = sanitize_for_log(stderr)
-                safe_stdout = sanitize_for_log(stdout)
-                safe_output = safe_stderr if safe_stderr else safe_stdout
-                error_preview = safe_output[:ERROR_PREVIEW_MAX_LENGTH] if safe_output else "(no output)"
-
-                install_hint = self.get_install_hint(cli_command)
-                logger.error(f"[CLI_CALL] {canonical_name} failed with exit code {process.returncode}")
-                # Already-sanitized stderr/stdout — safe to truncate for debug logs.
-                logger.debug(f"[CLI_CALL] stderr: {safe_stderr[:DEBUG_LOG_MAX_LENGTH]}")
-                logger.debug(f"[CLI_CALL] stdout: {safe_stdout[:DEBUG_LOG_MAX_LENGTH]}")
-                # humanize_error pattern-matches known CLI failures (e.g. codex "trusted dir",
-                # missing CLI on PATH, auth errors) and returns an actionable message.
-                # Falls through to the raw error preview + install hint when nothing matches.
-                # We detect a pattern match by looking for the humanizer's marker string
-                # "(Original error:" — equality check would fail on truncation/sanitization/empty input.
-                humanized = humanize_error(error_preview or "", canonical_name=canonical_name)
-                pattern_matched = "(Original error:" in humanized
-                if not pattern_matched:
-                    # CRITICAL: when no pattern matched, humanize_error returned the SANITIZED
-                    # raw error (with secrets stripped). Use that — NEVER the raw error_preview,
-                    # which may contain provider API keys, Bearer tokens, etc. if a misbehaving
-                    # CLI echoes them in its stderr/stdout. Earlier versions of this code used
-                    # error_preview here and would leak those secrets to the MCP caller.
-                    # Special-case empty input: humanize_error returns "Unknown error..." but
-                    # we prefer the cleaner "(no output)" wording in the failure message.
-                    sanitized_preview = humanized if error_preview else "(no output)"
-                    error_msg = (
-                        f"CLI '{cli_command}' failed with exit code {process.returncode}. "
-                        f"Error: {sanitized_preview}\n\n"
-                        f"Troubleshooting: {install_hint}"
-                    )
-                else:
-                    error_msg = humanized
-                return ModelResponse.error_response(
-                    error=error_msg,
-                    model=canonical_name,
-                    latency_ms=latency_ms,
-                )
+                return self._exit_error_response(cli_command, canonical_name, process.returncode, stdout_bytes, stderr_bytes, latency_ms)
 
             # Parse output
             stdout = stdout_bytes.decode("utf-8", errors="replace")
@@ -409,6 +368,297 @@ class CLIExecutor:
                 model=canonical_name,
                 latency_ms=latency_ms,
             )
+
+    # Room for the part header added by _frame_part, so a framed part stays under the cap.
+    _PART_FRAME_RESERVE = 1000
+
+    async def _execute_multi_turn(
+        self,
+        canonical_name: str,
+        model_config: ModelConfig,
+        cli_command: str,
+        prompt: str,
+        env: dict[str, str],
+    ) -> ModelResponse:
+        """Send a prompt longer than the CLI's per-turn cap as turns of one Codex thread.
+
+        Codex rejects a turn whose text exceeds its cap even when the model context is
+        larger. Every part but the last asks only for an acknowledgement; the last part
+        carries the end of the request, and its answer is the result. The thread's
+        rollout file holds the whole prompt, so it is removed afterwards.
+        """
+        assert model_config.cli_max_input_chars is not None
+        parts = self._split_prompt(prompt, model_config.cli_max_input_chars - self._PART_FRAME_RESERVE)
+        total = len(parts)
+        # Resuming needs a persisted session; the rollout is deleted in `finally`.
+        first_args = [arg for arg in model_config.cli_args if arg != "--ephemeral"]
+        safe_command = [sanitize_for_log(arg) for arg in [cli_command, *first_args]]
+        timeout = settings.model_timeout_seconds
+        logger.info(f"[CLI_CALL] model={canonical_name} command={cli_command} multi-turn input: {len(prompt)} chars in {total} parts")
+
+        start_time = time.perf_counter()
+        thread_id: str | None = None
+        process: asyncio.subprocess.Process | None = None
+        try:
+            for index, part in enumerate(parts, start=1):
+                if index == 1:
+                    command = [cli_command, *first_args]
+                else:
+                    assert thread_id is not None
+                    command = [cli_command, "exec", "resume", thread_id, "-", *model_config.cli_resume_args]
+
+                remaining = timeout - (time.perf_counter() - start_time)
+                if remaining <= 0:
+                    raise TimeoutError
+                process = await asyncio.create_subprocess_exec(
+                    *command,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=env,
+                )
+                stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                    process.communicate(input=self._frame_part(part, index, total).encode("utf-8")),
+                    timeout=remaining,
+                )
+                latency_ms = int((time.perf_counter() - start_time) * 1000)
+                stdout = stdout_bytes.decode("utf-8", errors="replace")
+
+                if index == 1:
+                    thread_id = self._codex_thread_id(stdout)
+                if process.returncode != 0:
+                    return self._exit_error_response(
+                        cli_command, canonical_name, process.returncode, stdout_bytes, stderr_bytes, latency_ms
+                    )
+                if thread_id is None:
+                    return ModelResponse.error_response(
+                        error=f"CLI '{cli_command}' reported no thread id; multi-turn input needs `exec --json`",
+                        model=canonical_name,
+                        latency_ms=latency_ms,
+                    )
+                if index < total:
+                    if not self._jsonl_turn_completed(stdout):
+                        return ModelResponse.error_response(
+                            error=f"CLI '{cli_command}' did not complete input part {index} of {total}",
+                            model=canonical_name,
+                            latency_ms=latency_ms,
+                        )
+                    continue
+
+                content = self._parse_output(stdout, model_config.cli_parser)
+                if not content.strip():
+                    error_msg = f"CLI '{cli_command}' returned empty output"
+                    logger.error(f"[CLI_CALL] {error_msg}")
+                    return ModelResponse.error_response(error=error_msg, model=canonical_name, latency_ms=latency_ms)
+
+                response = ModelResponse(
+                    content=content,
+                    status="success",
+                    metadata=ModelResponseMetadata(model=canonical_name, total_tokens=0, latency_ms=latency_ms),
+                )
+                log_llm_interaction(
+                    request_data={
+                        "model": canonical_name,
+                        "cli": True,
+                        "command": safe_command,
+                        "prompt_length": len(prompt),
+                        "input_parts": total,
+                    },
+                    response_data=response.model_dump(),
+                )
+                return response
+
+            raise RuntimeError("multi-turn input produced no final part")  # unreachable: parts is never empty
+
+        except TimeoutError:
+            latency_ms = int((time.perf_counter() - start_time) * 1000)
+            await self._terminate_subprocess(process, "timed-out")
+            logger.error(f"[CLI_CALL] {canonical_name} timed out after {timeout}s")
+            return ModelResponse.error_response(
+                error=f"CLI '{cli_command}' timed out after {timeout}s across {total} input parts. "
+                f"Consider increasing MODEL_TIMEOUT_SECONDS in config.",
+                model=canonical_name,
+                latency_ms=latency_ms,
+            )
+
+        except asyncio.CancelledError:
+            await self._terminate_subprocess(process, "cancelled")
+            raise
+
+        except Exception as e:
+            latency_ms = int((time.perf_counter() - start_time) * 1000)
+            await self._terminate_subprocess(process, "failed")
+            logger.error(f"[CLI_CALL] {canonical_name} failed with exception: {type(e).__name__}: {sanitize_for_log(str(e))}")
+            safe_error = humanize_error(f"{type(e).__name__}: {e!s}", canonical_name=canonical_name)
+            return ModelResponse.error_response(
+                error=f"CLI execution failed: {safe_error}",
+                model=canonical_name,
+                latency_ms=latency_ms,
+            )
+
+        finally:
+            if thread_id:
+                await self._delete_codex_thread(cli_command, thread_id, env)
+
+    @staticmethod
+    def _split_prompt(prompt: str, limit: int) -> list[str]:
+        """Split a prompt into parts of at most `limit` chars.
+
+        Prefers a file boundary (`\\n<file `), then a line break, in the second half of the
+        window, so parts stay large and files are rarely cut.
+        """
+        if limit <= 0:
+            raise ValueError(f"part limit must be positive, got {limit}")
+        parts: list[str] = []
+        rest = prompt
+        while len(rest) > limit:
+            window = rest[:limit]
+            cut = window.rfind("\n<file ")
+            if cut < limit // 2:
+                cut = window.rfind("\n")
+            if cut < limit // 2:
+                cut = limit
+            parts.append(rest[:cut])
+            rest = rest[cut:]
+        parts.append(rest)
+        return parts
+
+    @staticmethod
+    def _frame_part(part: str, index: int, total: int) -> str:
+        """Prefix a part with instructions that keep the model from answering early."""
+        if index < total:
+            header = (
+                f"[Multi-part input: part {index} of {total}. The request continues in the next message. "
+                f"Do not start the task and do not summarise; reply with exactly: ACK {index}/{total}]"
+            )
+        else:
+            header = (
+                f"[Multi-part input: part {index} of {total}, the last one. The previous parts and this one "
+                f"form a single request; carry it out now exactly as instructed.]"
+            )
+        return f"{header}\n\n{part}"
+
+    @staticmethod
+    def _iter_jsonl_events(stdout: str):
+        for line in stdout.splitlines():
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(event, dict):
+                yield event
+
+    @classmethod
+    def _codex_thread_id(cls, stdout: str) -> str | None:
+        for event in cls._iter_jsonl_events(stdout):
+            if event.get("type") == "thread.started" and isinstance(event.get("thread_id"), str):
+                return event["thread_id"]
+        return None
+
+    @classmethod
+    def _jsonl_turn_completed(cls, stdout: str) -> bool:
+        types = [event.get("type") for event in cls._iter_jsonl_events(stdout)]
+        return "turn.completed" in types and "turn.failed" not in types
+
+    async def _delete_codex_thread(self, cli_command: str, thread_id: str, env: dict[str, str]) -> None:
+        """Delete the persisted Codex thread: it holds the whole prompt.
+
+        `codex delete --force` removes the thread from Codex's state and history databases
+        and its rollout; removing a leftover rollout file is the fallback.
+        """
+        if not re.fullmatch(r"[0-9a-fA-F-]{8,64}", thread_id):
+            logger.warning("[CLI_CALL] unexpected Codex thread id format; thread not deleted")
+            return
+        process: asyncio.subprocess.Process | None = None
+        try:
+            process = await asyncio.create_subprocess_exec(
+                cli_command,
+                "delete",
+                "--force",
+                thread_id,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+            )
+            _, stderr_bytes = await asyncio.wait_for(process.communicate(), timeout=30)
+            if process.returncode != 0:
+                stderr = sanitize_for_log(stderr_bytes.decode("utf-8", errors="replace"))
+                logger.warning(f"[CLI_CALL] codex delete failed for thread {thread_id}: {stderr[:ERROR_PREVIEW_MAX_LENGTH]}")
+        except Exception as e:
+            await self._terminate_subprocess(process, "delete-failed")
+            logger.warning(f"[CLI_CALL] codex delete failed for thread {thread_id}: {type(e).__name__}")
+        self._remove_codex_rollout(thread_id, env)
+
+    @staticmethod
+    def _remove_codex_rollout(thread_id: str, env: dict[str, str]) -> None:
+        """Remove any rollout file left for `thread_id` after `codex delete`."""
+        codex_home = Path(env.get("CODEX_HOME") or Path.home() / ".codex")
+        sessions = codex_home / "sessions"
+        removed = 0
+        for path in sessions.rglob(f"*{thread_id}*.jsonl") if sessions.is_dir() else []:
+            try:
+                path.unlink()
+                removed += 1
+            except OSError as e:
+                logger.warning(f"[CLI_CALL] could not remove Codex rollout {path.name}: {e}")
+        if removed:
+            logger.warning(f"[CLI_CALL] removed {removed} Codex rollout file(s) left after delete for thread {thread_id}")
+
+    def _exit_error_response(
+        self,
+        cli_command: str,
+        canonical_name: str,
+        returncode: int | None,
+        stdout_bytes: bytes,
+        stderr_bytes: bytes,
+        latency_ms: int,
+    ) -> ModelResponse:
+        """Build a sanitized error response for a CLI that exited non-zero."""
+        stderr = stderr_bytes.decode("utf-8", errors="replace")
+        stdout = stdout_bytes.decode("utf-8", errors="replace")
+
+        # CRITICAL ordering: sanitize BEFORE truncation. If a bare secret value
+        # (e.g. AWS_SECRET_ACCESS_KEY which has no recognizable prefix) crosses
+        # the truncation boundary, exact-string-replace in sanitize_for_log can't
+        # match the full value, and a partial prefix would leak. Sanitize the whole
+        # output first, then truncate the redacted version for logs/error preview.
+        safe_stderr = sanitize_for_log(stderr)
+        safe_stdout = sanitize_for_log(stdout)
+        safe_output = safe_stderr if safe_stderr else safe_stdout
+        error_preview = safe_output[:ERROR_PREVIEW_MAX_LENGTH] if safe_output else "(no output)"
+
+        install_hint = self.get_install_hint(cli_command)
+        logger.error(f"[CLI_CALL] {canonical_name} failed with exit code {returncode}")
+        # Already-sanitized stderr/stdout — safe to truncate for debug logs.
+        logger.debug(f"[CLI_CALL] stderr: {safe_stderr[:DEBUG_LOG_MAX_LENGTH]}")
+        logger.debug(f"[CLI_CALL] stdout: {safe_stdout[:DEBUG_LOG_MAX_LENGTH]}")
+        # humanize_error pattern-matches known CLI failures (e.g. codex "trusted dir",
+        # missing CLI on PATH, auth errors) and returns an actionable message.
+        # Falls through to the raw error preview + install hint when nothing matches.
+        # We detect a pattern match by looking for the humanizer's marker string
+        # "(Original error:" — equality check would fail on truncation/sanitization/empty input.
+        humanized = humanize_error(error_preview or "", canonical_name=canonical_name)
+        pattern_matched = "(Original error:" in humanized
+        if not pattern_matched:
+            # CRITICAL: when no pattern matched, humanize_error returned the SANITIZED
+            # raw error (with secrets stripped). Use that — NEVER the raw error_preview,
+            # which may contain provider API keys, Bearer tokens, etc. if a misbehaving
+            # CLI echoes them in its stderr/stdout. Earlier versions of this code used
+            # error_preview here and would leak those secrets to the MCP caller.
+            # Special-case empty input: humanize_error returns "Unknown error..." but
+            # we prefer the cleaner "(no output)" wording in the failure message.
+            sanitized_preview = humanized if error_preview else "(no output)"
+            error_msg = (
+                f"CLI '{cli_command}' failed with exit code {returncode}. Error: {sanitized_preview}\n\nTroubleshooting: {install_hint}"
+            )
+        else:
+            error_msg = humanized
+        return ModelResponse.error_response(
+            error=error_msg,
+            model=canonical_name,
+            latency_ms=latency_ms,
+        )
 
     @staticmethod
     def get_install_hint(cli_command: str) -> str:

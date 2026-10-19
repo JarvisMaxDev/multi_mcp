@@ -1,6 +1,7 @@
 """Unit tests for CLI executor."""
 
 import asyncio
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -1742,3 +1743,140 @@ class TestCLIExecutor:
             assert "command" in call_args["request_data"]
             assert call_args["response_data"]["content"] == "Test response from CLI"
             assert call_args["response_data"]["status"] == "success"
+
+
+class TestCLIExecutorMultiTurnInput:
+    """Prompts above cli_max_input_chars go to one Codex thread in several turns."""
+
+    THREAD_ID = "01a15468-1778-7a10-8d6d-d251fe736944"
+
+    @pytest.fixture
+    def codex_config(self):
+        return ModelConfig(
+            provider="cli",
+            cli_command="codex",
+            cli_args=["exec", "--json", "--ephemeral", "--model", "m"],
+            cli_parser="jsonl",
+            cli_env={},
+            cli_max_input_chars=2500,
+            cli_resume_args=["--json", "--model", "m"],
+        )
+
+    @staticmethod
+    def _process(stdout_events: list[dict], returncode: int = 0):
+        process = MagicMock()
+        process.returncode = returncode
+        stdout = "\n".join(json.dumps(event) for event in stdout_events).encode()
+        process.communicate = AsyncMock(return_value=(stdout, b""))
+        return process
+
+    def _ack(self):
+        return self._process(
+            [
+                {"type": "thread.started", "thread_id": self.THREAD_ID},
+                {"type": "item.completed", "item": {"type": "agent_message", "text": "ACK 1/2"}},
+                {"type": "turn.completed"},
+            ]
+        )
+
+    @pytest.fixture
+    def rollout(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+        path = tmp_path / "sessions" / "2026" / "10" / "19" / f"rollout-2026-10-19T00-00-00-{self.THREAD_ID}.jsonl"
+        path.parent.mkdir(parents=True)
+        path.write_text("{}")
+        return path
+
+    def test_split_prompt_keeps_content_and_limit(self):
+        files = "".join(f'\n<file path="/p/f{i}.py">\n' + "x = 1\n" * 40 + "</file>" for i in range(20))
+        prompt = "SYSTEM" + files
+        parts = CLIExecutor._split_prompt(prompt, 1000)
+        assert "".join(parts) == prompt
+        assert all(len(part) <= 1000 for part in parts)
+        assert all(part.startswith("\n<file ") for part in parts[1:])
+
+    def test_split_prompt_cuts_long_line_hard(self):
+        parts = CLIExecutor._split_prompt("a" * 2500, 1000)
+        assert [len(part) for part in parts] == [1000, 1000, 500]
+
+    @pytest.mark.asyncio
+    async def test_long_prompt_uses_resume_and_removes_rollout(self, codex_config, rollout):
+        final = self._process(
+            [
+                {"type": "thread.started", "thread_id": self.THREAD_ID},
+                {"type": "item.completed", "item": {"type": "agent_message", "text": "REVIEW DONE"}},
+                {"type": "turn.completed"},
+            ]
+        )
+        with (
+            patch("shutil.which", return_value="/usr/bin/codex"),
+            patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
+            patch("multi_mcp.models.cli_executor.log_llm_interaction") as mock_log,
+        ):
+            first = self._ack()
+            mock_exec.side_effect = [first, final, self._process([])]
+            result = await CLIExecutor().execute(
+                canonical_name="codex-cli",
+                model_config=codex_config,
+                messages=[{"role": "user", "content": "B" * 2700}],
+            )
+
+        assert result.status == "success"
+        assert result.content == "REVIEW DONE"
+        assert mock_exec.call_count == 3
+        assert list(mock_exec.call_args_list[2].args) == ["codex", "delete", "--force", self.THREAD_ID]
+        first_command = list(mock_exec.call_args_list[0].args)
+        assert first_command == ["codex", "exec", "--json", "--model", "m"]
+        second_command = list(mock_exec.call_args_list[1].args)
+        assert second_command == ["codex", "exec", "resume", self.THREAD_ID, "-", "--json", "--model", "m"]
+        first_input = first.communicate.call_args.kwargs["input"].decode()
+        final_input = final.communicate.call_args.kwargs["input"].decode()
+        assert first_input.startswith("[Multi-part input: part 1 of 2.")
+        assert final_input.startswith("[Multi-part input: part 2 of 2, the last one.")
+        assert len(first_input) <= codex_config.cli_max_input_chars
+        assert mock_log.call_args.kwargs["request_data"]["input_parts"] == 2
+        assert not rollout.exists()
+
+    @pytest.mark.asyncio
+    async def test_failed_intermediate_turn_stops_and_removes_rollout(self, codex_config, rollout):
+        failed = self._process(
+            [
+                {"type": "thread.started", "thread_id": self.THREAD_ID},
+                {"type": "turn.failed", "error": {"message": "boom"}},
+            ]
+        )
+        with (
+            patch("shutil.which", return_value="/usr/bin/codex"),
+            patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
+            patch("multi_mcp.models.cli_executor.log_llm_interaction"),
+        ):
+            mock_exec.side_effect = [failed, self._process([])]
+            result = await CLIExecutor().execute(
+                canonical_name="codex-cli",
+                model_config=codex_config,
+                messages=[{"role": "user", "content": "B" * 2700}],
+            )
+
+        assert result.status == "error"
+        assert "part 1 of 2" in result.error
+        assert mock_exec.call_count == 2
+        assert list(mock_exec.call_args_list[1].args) == ["codex", "delete", "--force", self.THREAD_ID]
+        assert not rollout.exists()
+
+    @pytest.mark.asyncio
+    async def test_short_prompt_keeps_single_ephemeral_call(self, codex_config):
+        with (
+            patch("shutil.which", return_value="/usr/bin/codex"),
+            patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
+            patch("multi_mcp.models.cli_executor.log_llm_interaction"),
+        ):
+            mock_exec.return_value = self._ack()
+            result = await CLIExecutor().execute(
+                canonical_name="codex-cli",
+                model_config=codex_config,
+                messages=[{"role": "user", "content": "short"}],
+            )
+
+        assert result.status == "success"
+        assert mock_exec.call_count == 1
+        assert "--ephemeral" in list(mock_exec.call_args.args)

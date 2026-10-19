@@ -141,6 +141,11 @@ class ModelConfig(BaseModel):
     cli_args: list[str] = Field(default_factory=list)
     cli_env: dict[str, str] = Field(default_factory=dict)
     cli_parser: str = "json"  # "json", "jsonl", or "text"
+    # Multi-turn input for CLIs that cap the text of a single turn (Codex: 1 << 20 chars).
+    # When the prompt is longer, it is sent as consecutive turns of one Codex thread:
+    # `exec` with cli_args, then `exec resume <thread_id> -` with cli_resume_args.
+    cli_max_input_chars: int | None = None
+    cli_resume_args: list[str] = Field(default_factory=list)
 
     # Web search support
     provider_web_search: bool = Field(default=False, description="Whether this model supports provider-native web search via LiteLLM")
